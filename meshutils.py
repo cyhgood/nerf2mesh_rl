@@ -188,6 +188,78 @@ def clean_mesh(verts, faces, v_pct=1, min_f=8, min_d=5, repair=True, remesh=True
     return verts, faces
 
 
+def subdivide_longest_edges(verts, faces, candidates, return_event=False):
+    """Split requested longest edges and return each output face's input index.
+
+    Conflicting requests are processed in face index order. An edge is skipped
+    when any incident face has already been split in this round.
+    """
+    candidates = np.asarray(candidates, dtype=bool)
+    if candidates.shape != (len(faces),):
+        raise ValueError('candidates must contain one boolean per face')
+
+    edge_faces = {}
+    for face_id, face in enumerate(faces):
+        for i in range(3):
+            edge = tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+            edge_faces.setdefault(edge, []).append(face_id)
+
+    split_faces = {}
+    new_vertices = list(verts)
+    requested_edges = set()
+    edge_results = {}
+    executed_edges = []
+    request_status = {}
+    for face_id in np.flatnonzero(candidates):
+        face = faces[face_id]
+        edges = [(int(face[i]), int(face[(i + 1) % 3])) for i in range(3)]
+        lengths = [np.sum((verts[a] - verts[b]) ** 2) for a, b in edges]
+        edge = tuple(sorted(edges[int(np.argmax(lengths))]))
+        if edge in requested_edges:
+            request_status[int(face_id)] = edge_results[edge]
+            continue
+        requested_edges.add(edge)
+        incident_faces = edge_faces[edge]
+        if any(index in split_faces for index in incident_faces):
+            edge_results[edge] = 'conflict'
+            request_status[int(face_id)] = 'conflict'
+            continue
+        edge_results[edge] = 'executed'
+        request_status[int(face_id)] = 'executed'
+        executed_edges.append(list(edge))
+        midpoint_id = len(new_vertices)
+        new_vertices.append((verts[edge[0]] + verts[edge[1]]) * 0.5)
+        for index in incident_faces:
+            split_faces[index] = (edge, midpoint_id)
+
+    new_faces = []
+    parent_face_id = []
+    for face_id, face in enumerate(faces):
+        if face_id not in split_faces:
+            new_faces.append(face)
+            parent_face_id.append(face_id)
+            continue
+        edge, midpoint_id = split_faces[face_id]
+        for i in range(3):
+            a, b, opposite = int(face[i]), int(face[(i + 1) % 3]), int(face[(i + 2) % 3])
+            if tuple(sorted((a, b))) == edge:
+                new_faces.extend(((a, midpoint_id, opposite), (midpoint_id, b, opposite)))
+                parent_face_id.extend((face_id, face_id))
+                break
+
+    result = (np.asarray(new_vertices, dtype=verts.dtype).reshape(-1, 3),
+              np.asarray(new_faces, dtype=faces.dtype).reshape(-1, 3),
+              np.asarray(parent_face_id, dtype=np.int64))
+    if return_event:
+        successful = {face for face, status in request_status.items() if status == 'executed'}
+        passive = sorted(set(split_faces) - successful)
+        return result + ({'requested_faces': np.flatnonzero(candidates).tolist(),
+                          'request_status': request_status,
+                          'executed_edges': executed_edges,
+                          'passive_faces': passive},)
+    return result
+
+
 def decimate_and_refine_mesh(verts, faces, mask, decimate_ratio=0.1, refine_size=0.01, refine_remesh_size=0.02):
     # verts: [N, 3]
     # faces: [M, 3]

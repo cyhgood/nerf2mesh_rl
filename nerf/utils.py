@@ -1174,6 +1174,8 @@ class Trainer(object):
                 
                 self.log(f'[INFO] refine and decimate mesh at {self.global_step} step')
                 self.model.refine_and_decimate()
+                if self.model.refinement_event is not None:
+                    self.model.refinement_event['global_step'] = self.global_step
 
                 # reinit optim since params changed.
                 self.optimizer = self.optimizer_fn(self.model)

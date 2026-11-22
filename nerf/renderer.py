@@ -147,6 +147,8 @@ class NeRFRenderer(nn.Module):#
             self.triangles_errors = torch.zeros_like(self.triangles[:, 0], dtype=torch.float32).cuda()
             self.triangles_errors_cnt = torch.zeros_like(self.triangles[:, 0], dtype=torch.float32).cuda()
             self.triangles_errors_id = None
+            # Maps each current face to its face index before the latest local update.
+            self.parent_face_id = None
             
         else:
             self.glctx = None
@@ -192,7 +194,7 @@ class NeRFRenderer(nn.Module):#
         print(f'[INFO] update_aabb: {self.aabb_train.cpu().numpy().tolist()}')
 
     @torch.no_grad()
-    def refine_and_decimate(self): #自适应网格细化的核心函数
+    def refine_and_decimate(self, export_mesh=True): #自适应网格细化的核心函数
         #1.确保当前处于stage1
         assert self.opt.stage > 0
         #2.保存设备信息
@@ -218,14 +220,20 @@ class NeRFRenderer(nn.Module):#
 
         # find a threshold to decide whether we perform subdivision / decimation.
         #7.计算细化和简化阈值 使用误差的百分位数划分三角形
-        thresh_refine = np.percentile(errors[cnt_mask], 90) #表示误差排在前 10% 左右的阈值 errors > thresh_refine 需要细分
+        local_refine = getattr(self.opt, 'refine_mode', 'original') == 'local'
+        if local_refine and not cnt_mask.any():
+            thresh_refine = np.inf
+        else:
+            thresh_refine = np.percentile(errors[cnt_mask], 90) #表示误差排在前 10% 左右的阈值 errors > thresh_refine 需要细分
           
-        thresh_decimate = np.percentile(errors[cnt_mask], 50) #errors < thresh_decimate，可以简化
+        if not local_refine:
+            thresh_decimate = np.percentile(errors[cnt_mask], 50) #errors < thresh_decimate，可以简化
 
         #8.创建网格操作mask
         mask = np.zeros_like(errors) #初始时所有三角形都设置为0：不处理
         mask[(errors > thresh_refine) & cnt_mask] = 2 #高误差区域 2：细分
-        mask[(errors < thresh_decimate) & cnt_mask] = 1 #低误差区域 1：简化
+        if not local_refine:
+            mask[(errors < thresh_decimate) & cnt_mask] = 1 #低误差区域 1：简化
 
         #9.输出要处理的面片数量
         print(f'[INFO] faces to decimate {(mask == 1).sum()}, faces to refine {(mask == 2).sum()}')
@@ -239,13 +247,17 @@ class NeRFRenderer(nn.Module):#
             #11.执行网格简化和细分 这个函数真正修改网格拓扑 
             #refine_decimate_ratio 0.1 低误差区域简化比例 refine_size 0.01 高误差区域细分的边长阈值
             #refine_remesh_size 0.02 简化区域重新网格化的目标边长
-            v, f = decimate_and_refine_mesh(v, f, mask, decimate_ratio=self.opt.refine_decimate_ratio, refine_size=self.opt.refine_size, refine_remesh_size=self.opt.refine_remesh_size)
+            if local_refine:
+                v, f, parent_face_id, event = subdivide_longest_edges(v, f, mask == 2, return_event=True)
+            else:
+                v, f = decimate_and_refine_mesh(v, f, mask, decimate_ratio=self.opt.refine_decimate_ratio, refine_size=self.opt.refine_size, refine_remesh_size=self.opt.refine_remesh_size)
             
             # export
             #12.保存更新后的内层网格
             mesh = trimesh.Trimesh(v, f, process=False)
             #创建新的网格对象 mesh_0_updated.ply 用于检查当前自适应细化后的网格
-            mesh.export(os.path.join(self.opt.workspace, 'mesh_stage0', 'mesh_0_updated.ply'))
+            if export_mesh:
+                mesh.export(os.path.join(self.opt.workspace, 'mesh_stage0', 'mesh_0_updated.ply'))
             #13.重新读取网格数据
             v, f = mesh.vertices, mesh.faces
 
@@ -261,6 +273,7 @@ class NeRFRenderer(nn.Module):#
             triangles = []
             v_cumsum = [0]
             f_cumsum = [0]
+            parent_faces = []
 
             #16.遍历每个cascade 
             for cas in range(self.cascade):
@@ -275,11 +288,20 @@ class NeRFRenderer(nn.Module):#
 
                 #18.只细化内层网格
                 if cas == 0:
-                    cur_v, cur_f = decimate_and_refine_mesh(cur_v, cur_f, mask, decimate_ratio=self.opt.refine_decimate_ratio, refine_size=self.opt.refine_size, refine_remesh_size=self.opt.refine_remesh_size)
+                    if local_refine:
+                        cur_v, cur_f, parent_face_id, event = subdivide_longest_edges(cur_v, cur_f, mask == 2, return_event=True)
+                    else:
+                        cur_v, cur_f = decimate_and_refine_mesh(cur_v, cur_f, mask, decimate_ratio=self.opt.refine_decimate_ratio, refine_size=self.opt.refine_size, refine_remesh_size=self.opt.refine_remesh_size)
+                elif local_refine:
+                    parent_face_id = np.arange(len(cur_f), dtype=np.int64)
+
+                if local_refine:
+                    parent_faces.append(parent_face_id + self.f_cumsum[cas])
 
                 #19.保存各cascade网格
                 mesh = trimesh.Trimesh(cur_v, cur_f, process=False)
-                mesh.export(os.path.join(self.opt.workspace, 'mesh_stage0', f'mesh_{cas}_updated.ply'))
+                if export_mesh:
+                    mesh.export(os.path.join(self.opt.workspace, 'mesh_stage0', f'mesh_{cas}_updated.ply'))
 
                 #20.将局部网格重新合并 当前网格的面片索引原本是局部索引，需要加上前面网格的顶点数量，转换成全局索引
                 vertices.append(mesh.vertices)
@@ -294,11 +316,15 @@ class NeRFRenderer(nn.Module):#
             f = np.concatenate(triangles, axis=0)
             self.v_cumsum = np.array(v_cumsum)
             self.f_cumsum = np.array(f_cumsum)
+            if local_refine:
+                parent_face_id = np.concatenate(parent_faces)
 
         #三、重新放回GPU
         #23.重新更新顶点和三角形 将更新后的顶点NumPy CPU数组 转换回GPU Float32 Tensor
         self.vertices = torch.from_numpy(v).float().contiguous().to(device) # [N, 3]
         self.triangles = torch.from_numpy(f).int().contiguous().to(device)
+        self.parent_face_id = torch.from_numpy(parent_face_id).to(device) if local_refine else None
+        self.refinement_event = event if local_refine else None
         #24.重置顶点偏移量 因为网格拓扑已经发生改变 新的 vertices_offsets = 0 之后 Stage 1 会继续学习新的顶点偏移
         self.vertices_offsets = nn.Parameter(torch.zeros_like(self.vertices))
 

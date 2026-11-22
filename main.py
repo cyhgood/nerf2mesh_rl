@@ -109,6 +109,10 @@ if __name__ == '__main__':
     parser.add_argument('--ssaa', type=int, default=2, help="super sampling anti-aliasing ratio")
     parser.add_argument('--texture_size', type=int, default=4096, help="exported texture resolution")
     parser.add_argument('--refine', action='store_true', help="track face error and do subdivision")#开启自适应网格细化
+    parser.add_argument('--refine_mode', choices=['original', 'local'], default='original', help='stage 1 topology refinement mode')
+    parser.add_argument('--refine_experiment_steps', type=int, default=0, help='run a paired local refinement experiment for this many optimization steps')
+    parser.add_argument('--refine_experiment_views', type=int, default=5, help='number of fixed validation views for the refinement experiment')
+    parser.add_argument('--refine_experiment_output', type=str, default='', help='output directory for the refinement experiment')
     parser.add_argument("--refine_steps_ratio", type=float, action="append", default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.7])
     parser.add_argument('--refine_size', type=float, default=0.01, help="refine trig length")
     parser.add_argument('--refine_decimate_ratio', type=float, default=0.1, help="refine decimate ratio")
@@ -229,6 +233,11 @@ if __name__ == '__main__':
         
         else:
             valid_loader = NeRFDataset(opt, device=device, type='val').dataloader()
+
+            if opt.refine_experiment_steps:
+                from nerf.refinement_experiment import run_refinement_experiment
+                run_refinement_experiment(trainer, train_loader._data, valid_loader._data)
+                raise SystemExit(0)
 
             trainer.metrics = [PSNRMeter(),]
             trainer.train(train_loader, valid_loader, max_epoch)
