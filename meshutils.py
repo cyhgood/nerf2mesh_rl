@@ -226,7 +226,9 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     additions = []
     for face_id in candidate_order:
         if max_added_faces is not None and added_faces >= max_added_faces:
-            break
+            processed.append(int(face_id))
+            request_status[int(face_id)] = 'budget'
+            continue
         processed.append(int(face_id))
         face = faces[face_id]
         edges = [(int(face[i]), int(face[(i + 1) % 3])) for i in range(3)]

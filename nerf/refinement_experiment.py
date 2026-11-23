@@ -261,6 +261,13 @@ def run_refinement_experiment(trainer, train_data, val_data):
     start_step = trainer.global_step
     indices = np.random.RandomState(opt.seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
 
+    if getattr(opt, 'refine_rl', False):
+        from nerf.refinement_rl import run_refinement_rl
+        run_refinement_rl(trainer, train_data, val_data, selection_views, evaluation_views,
+                          indices, model_state, old_vertices, old_triangles,
+                          old_v_cumsum, old_f_cumsum, scaler_state, start_step)
+        return
+
     if getattr(opt, 'refine_compare_random', False):
         _run_random_comparison(trainer, train_data, val_data, before, selection_views,
                                evaluation_views, indices, model_state, old_vertices,

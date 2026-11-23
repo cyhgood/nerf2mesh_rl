@@ -13,6 +13,7 @@ from nerf.refinement_experiment import (
     _child_observations, _fixed_region_means, _foreground_errors, _matched_budget_plans, _select_views,
     run_refinement_experiment,
 )
+from nerf.refinement_rl import FacePolicy
 
 
 class RefinementExperimentTest(unittest.TestCase):
@@ -116,6 +117,7 @@ class RefinementExperimentTest(unittest.TestCase):
                                   ckpt=ckpt, mesh=mesh, seed=42)
             samples = []
             observed_views = []
+            effect = [False]
             trainer = SimpleNamespace(opt=opt, model=model, device=torch.device('cpu'),
                                       global_step=7, scaler=torch.cuda.amp.GradScaler(enabled=False),
                                       criterion=torch.nn.SmoothL1Loss(reduction='none'))
@@ -133,7 +135,8 @@ class RefinementExperimentTest(unittest.TestCase):
 
             def train_step(data):
                 samples.append(data)
-                return None, None, model.color.square() + model.vertices_offsets.square().sum()
+                target = 0.8 if effect[0] and len(model.triangles) > 2 else 0.
+                return None, None, (model.color - target).square() + model.vertices_offsets.square().sum()
 
             trainer.eval_step = eval_step
             trainer.train_step = train_step
@@ -175,6 +178,53 @@ class RefinementExperimentTest(unittest.TestCase):
                 self.assertEqual(run['branches']['high_error']['event']['parent_face_id'], [0, 0, 1, 1])
                 self.assertEqual(len(run['branches']['random']['foreground_errors_by_view']), 1)
             self.assertTrue(all(samples[:2] == samples[i:i + 2] for i in range(2, len(samples), 2)))
+
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 7
+            opt.refine = True
+            opt.refine_compare_random = False
+            opt.refine_rl = True
+            opt.refine_rl_rounds = 3
+            opt.refine_rl_reward_views = [0]
+            opt.refine_rl_lr = 0.01
+            opt.refine_rl_checkpoint = ''
+            opt.refine_rl_eval = False
+            opt.refine_experiment_output = os.path.join(directory, 'rl')
+            effect[0] = True
+            run_refinement_experiment(trainer, Dataset(), Dataset())
+            self.assertTrue(os.path.isfile(os.path.join(opt.refine_experiment_output, 'policy.pt')))
+            with open(os.path.join(opt.refine_experiment_output, 'round_0001.json')) as file:
+                record = json.load(file)
+            self.assertIn('parent_face_id', record)
+            self.assertLessEqual(record['actual_added_faces'], opt.refine_face_budget)
+            with open(os.path.join(opt.refine_experiment_output, 'rl_metadata.json')) as file:
+                metadata = json.load(file)
+            self.assertEqual(metadata['reward_views'], [0])
+            self.assertEqual(metadata['evaluation_views'], [1])
+            records = []
+            for i in range(1, 4):
+                with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}.json'.format(i))) as file:
+                    records.append(json.load(file))
+            self.assertTrue(any(record['policy_loss'] is not None and record['mean_reward'] != 0
+                                for record in records))
+            saved_policy = os.path.join(opt.refine_experiment_output, 'policy.pt')
+            torch.manual_seed(opt.seed)
+            initial_policy = FacePolicy()
+            saved = torch.load(saved_policy, map_location='cpu')
+            self.assertTrue(any(not torch.equal(value, saved['policy'][name])
+                                for name, value in initial_policy.state_dict().items()))
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 7
+            opt.refine = True
+            opt.refine_rl_eval = True
+            opt.refine_rl_rounds = 1
+            opt.refine_rl_checkpoint = saved_policy
+            opt.refine_experiment_output = os.path.join(directory, 'rl_eval')
+            run_refinement_experiment(trainer, Dataset(), Dataset())
+            with open(os.path.join(opt.refine_experiment_output, 'round_0001.json')) as file:
+                self.assertIsNone(json.load(file)['policy_loss'])
 
 
 if __name__ == '__main__':
