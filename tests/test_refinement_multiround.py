@@ -1,3 +1,4 @@
+import copy
 import os
 import tempfile
 import unittest
@@ -8,12 +9,41 @@ import numpy as np
 import torch
 
 from meshutils import subdivide_longest_edges
-from nerf.refinement_multiround import edge_costs, lineage_returns, local_rewards
+from nerf.refinement_multiround import edge_costs, lineage_returns, local_rewards, _region_stats, _silhouette_owners, joint_policy_loss
 from nerf import refinement_multiround
 from nerf.refinement_rl import FacePolicy
 
 
 class MultiRoundTest(unittest.TestCase):
+    def test_uncovered_target_pixels_assigned_to_nearby_face(self):
+        faces = np.array([0, -1, -1, 1, -1])
+        target = np.array([1., 1., 1., 1., 0.])
+        owners = _silhouette_owners(faces, target, (1, 5), 1.0)
+        np.testing.assert_array_equal(owners, [0, 0, 1, 1, -1])
+        before = [(faces, np.zeros(5), np.array([0., 1., 1., 0., 0.]), target, (1, 5))]
+        after = [(faces, np.zeros(5), np.array([0., 0., 1., 0., 0.]), target, (1, 5))]
+        counts, first, last = _region_stats(before, after, 2, 2, 1.0)
+        np.testing.assert_array_equal(counts, [2, 2])
+        np.testing.assert_allclose(first, [0.5, 0.5])
+        np.testing.assert_allclose(last, [0.0, 0.5])
+        np.testing.assert_array_equal(_silhouette_owners(np.full(5, -1), target, (1, 5), 2), np.full(5, -1))
+
+    def test_joint_score_includes_hold_and_failed_requests(self):
+        class Logits(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.values = torch.nn.Parameter(torch.zeros(3))
+            def forward(self, x):
+                return self.values
+        policy = Logits()
+        transition = {'features': np.zeros((3, 3), dtype=np.float32),
+                      'actions': np.array([False, True, True]),
+                      'event': {'request_status': {1: 'conflict', 2: 'budget'}}}
+        objective, losses = joint_policy_loss(policy, [transition], [np.array([1.0])])
+        self.assertEqual(objective, 1.0)
+        losses[0].backward()
+        torch.testing.assert_close(policy.values.grad, torch.tensor([0.5, -0.5, -0.5]))
+
     def test_local_reward_and_invalid_observation(self):
         counts = np.array([2, 0])
         reward = local_rewards(np.array([0.8, 0.]), np.array([0.5, 0.]),
@@ -152,6 +182,46 @@ class MultiRoundTest(unittest.TestCase):
             self.assertEqual(continued_state['global_step'], 4)
             self.assertEqual(len(continued_state['history']), 3)
             self.assertEqual(continued_state['transitions'][0]['round'], 4)
+            legacy = copy.deepcopy(full_state)
+            legacy['config'].pop('horizon')
+            legacy['config'].pop('silhouette_radius')
+            legacy['config']['pixel_regions'] = 'pre-update face index for each reward-view pixel'
+            legacy_path = os.path.join(directory, 'legacy.pt')
+            torch.save(legacy, legacy_path)
+            legacy_dir = os.path.join(directory, 'legacy_continued')
+            os.mkdir(legacy_dir)
+            legacy_trainer = make_trainer(legacy_dir, ckpt, mesh, legacy_path)
+            legacy_trainer.opt.refine_multiround_rounds = 1
+            refinement_multiround.run_multiround(legacy_trainer, Dataset(), Dataset(), [0], [1])
+            restored = torch.load(os.path.join(legacy_dir, 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(len(restored['history']), 3)
+            self.assertEqual(restored['transitions'][0]['round'], 4)
+            # A six-round segment resumed after round three matches an uninterrupted segment.
+            paths = [os.path.join(directory, name) for name in ('full_six', 'first_three', 'last_three')]
+            for path in paths:
+                os.mkdir(path)
+            full_six = make_trainer(paths[0], ckpt, mesh)
+            full_six.opt.refine_multiround_horizon = 6
+            full_six.opt.refine_multiround_rounds = 6
+            refinement_multiround.run_multiround(full_six, Dataset(), Dataset(), [0], [1])
+            first_three = make_trainer(paths[1], ckpt, mesh)
+            first_three.opt.refine_multiround_horizon = 6
+            refinement_multiround.run_multiround(first_three, Dataset(), Dataset(), [0], [1])
+            pending = torch.load(os.path.join(paths[1], 'trajectory.pt'), map_location='cpu')
+            self.assertFalse(pending['completed'])
+            self.assertEqual(len(pending['transitions']), 3)
+            last_three = make_trainer(paths[2], ckpt, mesh, os.path.join(paths[1], 'trajectory.pt'))
+            last_three.opt.refine_multiround_horizon = 6
+            refinement_multiround.run_multiround(last_three, Dataset(), Dataset(), [0], [1])
+            expected = torch.load(os.path.join(paths[0], 'trajectory.pt'), map_location='cpu')
+            actual = torch.load(os.path.join(paths[2], 'trajectory.pt'), map_location='cpu')
+            self.assertTrue(actual['completed'])
+            self.assertEqual(len(actual['transitions']), 6)
+            torch.testing.assert_close(expected['vertices'], actual['vertices'])
+            for key in expected['policy']:
+                torch.testing.assert_close(expected['policy'][key], actual['policy'][key])
+            for expected_round, actual_round in zip(expected['transitions'], actual['transitions']):
+                np.testing.assert_allclose(expected_round['lineage_return'], actual_round['lineage_return'], equal_nan=True)
 
 
 if __name__ == '__main__':
