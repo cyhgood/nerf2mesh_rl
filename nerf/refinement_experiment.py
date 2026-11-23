@@ -261,6 +261,13 @@ def run_refinement_experiment(trainer, train_data, val_data):
     start_step = trainer.global_step
     indices = np.random.RandomState(opt.seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
 
+    if getattr(opt, 'refine_multibranch_eval', False):
+        from nerf.refinement_multibranch import run_multibranch
+        run_multibranch(trainer, train_data, val_data, selection_views, evaluation_views,
+                        model_state, old_vertices, old_triangles, old_v_cumsum,
+                        old_f_cumsum, scaler_state, start_step)
+        return
+
     if getattr(opt, 'refine_multiround', False):
         from nerf.refinement_multiround import run_multiround
         run_multiround(trainer, train_data, val_data, selection_views, evaluation_views)

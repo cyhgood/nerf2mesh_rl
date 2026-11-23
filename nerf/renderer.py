@@ -1067,7 +1067,7 @@ class NeRFRenderer(nn.Module):#
         #训练时，程序根据：当前像素属于哪个三角形，把像素误差累积到对应三角形上：像素误差 → 三角形误差，
         #误差大的三角形后续会被细分，误差小的区域可能被简化
         self.triangles_errors_id = trig_id
-        if getattr(self.opt, 'refine_multiround', False):
+        if getattr(self.opt, 'refine_multiround', False) or getattr(self.opt, 'refine_multibranch_eval', False):
             self.refinement_alpha = (1 - T).detach().reshape(*prefix)
         
         #十一、合成背景
