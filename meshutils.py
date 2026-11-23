@@ -210,6 +210,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     requested_edges = set()
     edge_results = {}
     executed_edges = []
+    edge_events = []
     request_status = {}
     if max_added_faces is not None and max_added_faces < 0:
         raise ValueError('max_added_faces must be nonnegative')
@@ -252,6 +253,9 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
         edge_results[edge] = 'executed'
         request_status[int(face_id)] = 'executed'
         executed_edges.append(list(edge))
+        edge_events.append({'edge': list(edge), 'requester_face': int(face_id),
+                            'affected_faces': list(map(int, incident_faces)),
+                            'added_faces': len(incident_faces)})
         added_faces += len(incident_faces)
         additions.append(added_faces)
         midpoint_id = len(new_vertices)
@@ -283,6 +287,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
         return result + ({'requested_faces': processed,
                           'request_status': request_status,
                           'executed_edges': executed_edges,
+                          'edge_events': edge_events,
                           'passive_faces': passive, 'added_faces': added_faces,
                           'considered_count': considered_count,
                           'cumulative_added_faces': additions},)

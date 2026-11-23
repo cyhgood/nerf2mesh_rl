@@ -261,6 +261,11 @@ def run_refinement_experiment(trainer, train_data, val_data):
     start_step = trainer.global_step
     indices = np.random.RandomState(opt.seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
 
+    if getattr(opt, 'refine_multiround', False):
+        from nerf.refinement_multiround import run_multiround
+        run_multiround(trainer, train_data, val_data, selection_views, evaluation_views)
+        return
+
     if getattr(opt, 'refine_rl', False):
         from nerf.refinement_rl import run_refinement_rl
         run_refinement_rl(trainer, train_data, val_data, selection_views, evaluation_views,
