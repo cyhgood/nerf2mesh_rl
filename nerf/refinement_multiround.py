@@ -13,7 +13,7 @@ from nerf.refinement_experiment import _fixed_region_means, _observe, _select_vi
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256, policy_order
 
 
-POLICY_OBJECTIVE = 'face_return_plackett_luce_v1'
+POLICY_OBJECTIVE = 'face_advantage_valid_children_v2'
 
 
 def edge_costs(event, face_count):
@@ -34,9 +34,10 @@ def local_rewards(rgb_before, rgb_after, sil_before, sil_after, counts, costs, w
     return reward
 
 
-def lineage_returns(transitions, gamma):
-    """Propagate returns backwards; any missing positive-area child invalidates its parent."""
+def lineage_returns(transitions, gamma, return_missing=False):
+    """Renormalize over valid positive-area children; retain reward if none exist."""
     result = [None] * len(transitions)
+    child_stats = [None] * len(transitions)
     for t in range(len(transitions) - 1, -1, -1):
         reward = np.asarray(transitions[t]['reward'], dtype=np.float64)
         current = reward.copy()
@@ -46,38 +47,55 @@ def lineage_returns(transitions, gamma):
             child_returns = result[t + 1]
             if len(parents) != len(child_returns) or len(areas) != len(parents):
                 raise ValueError('Lineage does not match the next round mesh')
-            total = np.bincount(parents, weights=areas, minlength=len(reward))
-            missing = np.bincount(parents, weights=areas * ~np.isfinite(child_returns), minlength=len(reward))
-            weighted = np.bincount(parents, weights=areas * np.nan_to_num(child_returns, nan=0.0), minlength=len(reward))
-            valid = np.isfinite(reward) & (total > 0) & (missing == 0)
-            current[:] = np.nan
+            valid_child = np.isfinite(child_returns) & np.isfinite(areas) & (areas > 0)
+            missing = np.bincount(parents[~valid_child], minlength=len(reward))
+            valid_counts = np.bincount(parents[valid_child], minlength=len(reward))
+            child_stats[t] = {'missing_child_counts': missing, 'valid_child_counts': valid_counts}
+            total = np.bincount(parents[valid_child], weights=areas[valid_child], minlength=len(reward))
+            weighted = np.bincount(parents[valid_child], weights=areas[valid_child] * child_returns[valid_child], minlength=len(reward))
+            valid = np.isfinite(reward) & (total > 0)
             current[valid] = reward[valid] + gamma * weighted[valid] / total[valid]
         result[t] = current
-    return result
+    return (result, child_stats) if return_missing else result
 
 
-def face_policy_losses(policy, transitions, returns):
+def face_policy_losses(policy, transitions, returns, baseline='none', scale='none', clip=0.0,
+                       return_stats=False):
     """Weight each considered ranking decision by that face's lineage return."""
     losses = []
+    stats = []
     for transition, face_returns in zip(transitions, returns):
         order = torch.as_tensor(transition['selection_order'], dtype=torch.long)
         count = transition['considered_count']
         if not count:
             losses.append(None)
+            stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
             continue
         ordered_faces = transition['visible'][order[:count].numpy()]
         values = face_returns[ordered_faces]
         valid = np.isfinite(values)
         if not valid.any():
             losses.append(None)
+            stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
             continue
         logits = policy(torch.from_numpy(transition['features']))[order]
         denominators = torch.logcumsumexp(logits.flip(0), dim=0).flip(0)
         log_probabilities = (logits - denominators)[:count]
         mask = torch.from_numpy(valid)
-        weighted_returns = torch.as_tensor(values[valid], dtype=logits.dtype)
+        raw = values[valid]
+        baseline_value = float(raw.mean()) if baseline == 'mean' else 0.0
+        advantages = raw - baseline_value
+        scale_value = float(advantages.std()) if scale == 'std' else 1.0
+        if scale_value < 1e-8:
+            scale_value = 1.0
+        advantages = advantages / scale_value
+        if clip > 0:
+            advantages = np.clip(advantages, -clip, clip)
+        stats.append({'raw': _distribution(raw), 'processed': _distribution(advantages),
+                      'baseline': baseline_value, 'scale': scale_value})
+        weighted_returns = torch.as_tensor(advantages, dtype=logits.dtype)
         losses.append(-(log_probabilities[mask] * weighted_returns).sum())
-    return losses
+    return (losses, stats) if return_stats else losses
 
 
 def _distribution(values):
@@ -91,14 +109,35 @@ def _distribution(values):
             **dict(zip(('min', 'p25', 'median', 'p75', 'max'), map(float, quantiles)))}
 
 
-def reward_distributions(transition, weights, returns=None):
-    valid = transition['reward_pixels'] > 0
+def reward_distributions(transition, weights, returns=None, face_ids=None):
+    valid = ((transition['reward_pixels'] > 0) & np.isfinite(transition['reward']) &
+             np.isfinite(transition['sil_before']) & np.isfinite(transition['sil_after']) &
+             np.isfinite(transition['rgb_before']) & np.isfinite(transition['rgb_after']))
+    if face_ids is not None:
+        selected = np.zeros(len(valid), dtype=bool)
+        selected[np.asarray(sorted(face_ids), dtype=np.int64)] = True
+        valid &= selected
     silhouette = np.where(valid, weights[0] * (transition['sil_before'] - transition['sil_after']), np.nan)
     rgb = np.where(valid, weights[1] * (transition['rgb_before'] - transition['rgb_after']), np.nan)
     cost = np.where(valid, -weights[2] * transition['costs'], np.nan)
     return {'silhouette': _distribution(silhouette), 'rgb': _distribution(rgb),
             'face_cost': _distribution(cost), 'local_reward': _distribution(transition['reward']),
-            'lineage_return': _distribution([] if returns is None else returns)}
+            'lineage_return': _distribution([] if returns is None else np.where(valid, returns, np.nan))}
+
+
+def grouped_rewards(transition, weights, returns=None):
+    event = transition['event']
+    executed = {int(edge['requester_face']) for edge in event['edge_events']}
+    passive = set(map(int, event['passive_faces']))
+    unexecuted = {int(face) for face, status in event['request_status'].items()
+                  if status in ('conflict', 'budget')}
+    not_considered = {int(face) for face, status in event['request_status'].items()
+                      if status == 'budget_not_considered'}
+    result = {}
+    for name, faces in [('executed', executed), ('passive', passive),
+                        ('unexecuted', unexecuted), ('not_considered', not_considered)]:
+        result[name] = {'faces': len(faces), 'same_valid_set': reward_distributions(transition, weights, returns, faces)}
+    return result
 
 
 def action_counts(transition):
@@ -180,6 +219,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     opt = trainer.opt
     horizon = getattr(opt, 'refine_multiround_horizon', 3)
     radius = getattr(opt, 'refine_silhouette_radius', 8.0)
+    advantage_baseline = getattr(opt, 'refine_advantage_baseline', 'mean')
+    advantage_scale = getattr(opt, 'refine_advantage_scale', 'std')
+    advantage_clip = getattr(opt, 'refine_advantage_clip', 5.0)
     if (not opt.refine_rl or opt.refine_compare_random or opt.refine_rl_eval or
             opt.refine_face_budget < 1 or opt.refine_multiround_rounds < 1 or horizon < 1 or opt.refine_rl_lr <= 0 or
             not 0 <= opt.refine_multiround_gamma <= 1):
@@ -189,6 +231,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         raise ValueError('Reward weights and face cost must be finite and nonnegative')
     if not np.isfinite(radius) or radius < 0:
         raise ValueError('Silhouette assignment radius must be finite and nonnegative')
+    if (advantage_baseline not in ('none', 'mean') or advantage_scale not in ('none', 'std')
+            or not np.isfinite(advantage_clip) or advantage_clip < 0):
+        raise ValueError('Invalid advantage baseline, scale, or clip')
     reward_views = opt.refine_rl_reward_views or selection_views
     _select_views(len(val_data.poses), 1, selection_views, evaluation_views)
     if (not reward_views or len(reward_views) != len(set(reward_views)) or
@@ -206,7 +251,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'pixel_regions': 'pre-update face index; uncovered target pixels assigned to nearest face within radius for silhouette',
               'lineage_weights': 'child area after optimization normalized over each parent',
               'cost_allocation': 'all faces added by an edge charged once to its first executing requester',
-              'policy_objective': POLICY_OBJECTIVE}
+              'policy_objective': POLICY_OBJECTIVE,
+              'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
+              'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
                         'refine_multiround_horizon', 'refine_silhouette_radius'}
     config['options'] = {key: value for key, value in vars(opt).items() if key not in excluded_options}
@@ -237,10 +284,15 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             old_config.pop('pixel_regions', None)
             requested_config.pop('pixel_regions', None)
         if saved['completed'] and old_objective != POLICY_OBJECTIVE:
+            old_config.pop('advantage_config', None)
+            requested_config.pop('advantage_config', None)
+            old_config.pop('lineage_missing_rule', None)
+            requested_config.pop('lineage_missing_rule', None)
             old_options = dict(old_config.get('options', {}))
             new_options = dict(requested_config.get('options', {}))
             for key in ('refine_multibranch_eval', 'refine_multibranch_policy',
-                        'refine_multibranch_rounds', 'refine_multibranch_total_budget'):
+                        'refine_multibranch_rounds', 'refine_multibranch_total_budget',
+                        'refine_advantage_baseline', 'refine_advantage_scale', 'refine_advantage_clip'):
                 if key not in old_options:
                     new_options.pop(key, None)
             old_config['options'], requested_config['options'] = old_options, new_options
@@ -374,6 +426,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'sil_before': _json_values(transition['sil_before']), 'sil_after': _json_values(transition['sil_after']),
                       'local_reward': _json_values(transition['reward']), 'lineage_return': None,
                       'reward_distributions': reward_distributions(transition, weights),
+                      'reward_groups': grouped_rewards(transition, weights),
                       'policy_loss': None, 'evaluation': transition['evaluation']}
             record.update(action_counts(transition))
             with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}_pending.json'.format(transition['round'])), 'w') as output:
@@ -383,8 +436,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         trainer.log('[INFO] open return segment: {}/{} rounds; resume trajectory.pt'.format(len(transitions), horizon))
         return
 
-    returns = lineage_returns(transitions, opt.refine_multiround_gamma)
-    losses = face_policy_losses(policy, transitions, returns)
+    returns, child_stats = lineage_returns(transitions, opt.refine_multiround_gamma, return_missing=True)
+    losses, advantage_stats = face_policy_losses(policy, transitions, returns, advantage_baseline,
+                                                 advantage_scale, advantage_clip, return_stats=True)
     valid_losses = [loss for loss in losses if loss is not None]
     if valid_losses:
         optimizer.zero_grad()
@@ -395,12 +449,22 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         passive_faces = set(event['passive_faces'])
         transition['lineage_return'] = values
         transition['policy_loss'] = float(loss.detach()) if loss is not None else None
+        transition['child_observation_stats'] = child_stats[t]
+        transition['advantage_stats'] = advantage_stats[t]
         record = {'round': transition['round'], 'faces_before': transition['faces_before'],
                   'faces_after': transition['faces_after'], 'global_step': transition['global_step'],
                   'training_indices': transition['training_indices'], 'event': event,
                   'executed_edges': len(event['executed_edges']), 'added_faces': event['added_faces'],
                   'policy_loss': transition['policy_loss'],
                   'reward_distributions': reward_distributions(transition, weights, values),
+                  'reward_groups': grouped_rewards(transition, weights, values),
+                  'advantage_stats': advantage_stats[t],
+                  'missing_descendants': None if child_stats[t] is None else {
+                      'missing_child_counts': child_stats[t]['missing_child_counts'].tolist(),
+                      'valid_child_counts': child_stats[t]['valid_child_counts'].tolist(),
+                      'parents_with_missing_children': int(np.count_nonzero(child_stats[t]['missing_child_counts'])),
+                      'valid_reward_without_valid_children': int(np.count_nonzero(
+                          np.isfinite(transition['reward']) & (child_stats[t]['valid_child_counts'] == 0)))},
                   'segment_horizon': horizon,
                   'segment_start_round': transitions[0]['round'],
                   'segment_terminal_round': transitions[-1]['round'],

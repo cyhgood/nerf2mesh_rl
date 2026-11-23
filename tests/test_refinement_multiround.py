@@ -10,7 +10,8 @@ import torch
 
 from meshutils import subdivide_longest_edges
 from nerf.refinement_multiround import (edge_costs, lineage_returns, local_rewards, _region_stats,
-                                        _silhouette_owners, face_policy_losses, reward_distributions, action_counts)
+                                        _silhouette_owners, face_policy_losses, reward_distributions, action_counts,
+                                        grouped_rewards)
 from nerf import refinement_multiround
 from nerf.refinement_rl import FacePolicy
 
@@ -67,6 +68,31 @@ class MultiRoundTest(unittest.TestCase):
         self.assertAlmostEqual(result['face_cost']['sum'], -.4)
         self.assertEqual(result['lineage_return']['count'], 2)
 
+    def test_advantages_after_returns_and_clipping(self):
+        policy = FacePolicy()
+        transition = {'features': np.ones((3, 3), dtype=np.float32), 'visible': np.arange(3),
+                      'selection_order': np.arange(3), 'considered_count': 3}
+        raw = np.array([1., 2., 100.])
+        _, stats = face_policy_losses(policy, [transition], [raw], 'mean', 'std', .5, True)
+        self.assertAlmostEqual(stats[0]['baseline'], raw.mean())
+        self.assertEqual(stats[0]['raw']['max'], 100.)
+        self.assertLessEqual(stats[0]['processed']['max'], .5)
+        self.assertGreaterEqual(stats[0]['processed']['min'], -.5)
+        np.testing.assert_array_equal(raw, [1., 2., 100.])
+
+    def test_grouped_components_share_valid_faces(self):
+        transition = {'reward_pixels': np.array([1, 1, 0]), 'reward': np.array([.2, .1, np.nan]),
+                      'sil_before': np.array([1., 2., 3.]), 'sil_after': np.array([.9, 1., 2.]),
+                      'rgb_before': np.array([1., 1., 1.]), 'rgb_after': np.array([.9, .5, .2]),
+                      'costs': np.array([2, 0, 0]),
+                      'event': {'edge_events': [{'requester_face': 0}], 'passive_faces': [1],
+                                'request_status': {0: 'executed', 1: 'conflict', 2: 'budget_not_considered'}}}
+        groups = grouped_rewards(transition, [1, 1, .1], np.array([.2, np.nan, 5.]))
+        self.assertEqual(groups['executed']['same_valid_set']['face_cost']['count'], 1)
+        self.assertEqual(groups['passive']['same_valid_set']['lineage_return']['count'], 0)
+        self.assertEqual(groups['unexecuted']['same_valid_set']['rgb']['count'], 1)
+        self.assertEqual(groups['not_considered']['same_valid_set']['rgb']['count'], 0)
+
     def test_local_reward_and_invalid_observation(self):
         counts = np.array([2, 0])
         reward = local_rewards(np.array([0.8, 0.]), np.array([0.5, 0.]),
@@ -98,10 +124,14 @@ class MultiRoundTest(unittest.TestCase):
         np.testing.assert_allclose(result[1], [4., 6.5, 9.])
         np.testing.assert_allclose(result[0], [1 + 0.5 * (4. + 3 * 6.5) / 4, 6.5])
         transitions[2]['reward'][1] = np.nan
-        result = lineage_returns(transitions, 0.5)
-        self.assertTrue(np.isnan(result[1][1]))
-        self.assertTrue(np.isnan(result[0][0]))
+        result, stats = lineage_returns(transitions, 0.5, return_missing=True)
+        self.assertAlmostEqual(result[1][1], 7.)
+        self.assertAlmostEqual(result[0][0], 1 + .5 * (4 + 3 * 7) / 4)
+        self.assertEqual(stats[1]['missing_child_counts'][1], 1)
         self.assertTrue(np.isfinite(result[0][1]))
+        transitions[2]['reward'][2] = np.nan
+        result = lineage_returns(transitions, 0.5)
+        self.assertEqual(result[1][1], 4.)
 
     def test_interrupted_resume_matches_uninterrupted(self):
         class Model(torch.nn.Module):
@@ -138,6 +168,7 @@ class MultiRoundTest(unittest.TestCase):
                                   refine_face_budget=2, refine_multiround_rounds=3, refine_rl_lr=0.01,
                                   refine_multiround_gamma=0.9, refine_multiround_sil_weight=1.,
                                   refine_multiround_rgb_weight=1., refine_multiround_face_cost=0.001,
+                                  refine_advantage_baseline='none', refine_advantage_scale='none', refine_advantage_clip=0.,
                                   refine_rl_reward_views=[0], ckpt=ckpt, mesh=mesh, seed=42,
                                   refine_experiment_steps=1, refine_experiment_output=output,
                                   refine_multiround_resume=resume, refine=True)
@@ -209,6 +240,10 @@ class MultiRoundTest(unittest.TestCase):
             legacy['config'].pop('horizon')
             legacy['config'].pop('silhouette_radius')
             legacy['config'].pop('policy_objective')
+            legacy['config'].pop('advantage_config')
+            legacy['config'].pop('lineage_missing_rule')
+            for key in ('refine_advantage_baseline', 'refine_advantage_scale', 'refine_advantage_clip'):
+                legacy['config']['options'].pop(key, None)
             legacy['config']['pixel_regions'] = 'pre-update face index for each reward-view pixel'
             legacy_path = os.path.join(directory, 'legacy.pt')
             torch.save(legacy, legacy_path)

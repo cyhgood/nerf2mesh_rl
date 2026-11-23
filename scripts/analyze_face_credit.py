@@ -65,7 +65,21 @@ def overlap(left, right):
             'jaccard': len(left & right) / len(union) if union else None}
 
 
-def branch_lineages(branch, initial_faces):
+def recorded_face_observations(path):
+    with np.load(path, allow_pickle=False) as data:
+        metrics = {'rgb_mean': data['rgb_mean'], 'area': data['area'],
+                   'visible_pixels': data['visible_pixels'],
+                   'contour_near_pixels': data['contour_near_pixels'],
+                   'min_contour_distance_pixels': data['min_contour_distance_pixels']}
+        groups = {'executed_requesters': data['executed_requester'], 'passive': data['passive'],
+                  'unexecuted_requests': np.isin(data['status'], ['conflict', 'budget']),
+                  'not_considered': data['status'] == 'budget_not_considered'}
+        return {name: {'faces': int(mask.sum()),
+                       'metrics': {metric: distribution(values[mask]) for metric, values in metrics.items()}}
+                for name, mask in groups.items()}
+
+
+def branch_lineages(branch, initial_faces, comparison_dir=None):
     roots = np.arange(initial_faces, dtype=np.int64)
     result = []
     for item in branch.get('rounds', []):
@@ -77,27 +91,31 @@ def branch_lineages(branch, initial_faces):
         parent = array(event['parent_face_id'], np.int64)
         if np.any(parent < 0) or np.any(parent >= len(roots)):
             raise ValueError('Invalid parent_face_id in comparison results')
-        result.append({'round': int(item['round']),
+        row = {'round': int(item['round']),
                        'executed_requester_roots': set(map(int, roots[list(requesters)])),
                        'affected_roots': set(map(int, roots[list(affected)])),
                        'executed_requesters': len(requesters), 'affected_faces': len(affected),
-                       'actual_added_faces': int(item['actual_added_faces'])})
+                       'actual_added_faces': int(item['actual_added_faces'])}
+        if comparison_dir is not None and item.get('face_observations'):
+            row['face_observations'] = recorded_face_observations(
+                os.path.join(comparison_dir, item['face_observations']))
+        result.append(row)
         roots = roots[parent]
     return result
 
 
-def compare_branches(data):
+def compare_branches(data, comparison_dir=None):
     branches = data['branches']
     reference = next((branch for branch in branches if branch.get('method') == 'rl'), None)
     if reference is None:
         raise ValueError('Comparison contains no RL branch')
     initial_faces = int(data['initial_faces'])
-    rl = branch_lineages(reference, initial_faces)
+    rl = branch_lineages(reference, initial_faces, comparison_dir)
     compared = []
     for branch in branches:
         if branch is reference:
             continue
-        other = branch_lineages(branch, initial_faces)
+        other = branch_lineages(branch, initial_faces, comparison_dir)
         rounds = []
         for left, right in zip(rl, other):
             if left['round'] != right['round']:
@@ -106,7 +124,9 @@ def compare_branches(data):
                            'requester_initial_ancestor_overlap': overlap(left['executed_requester_roots'], right['executed_requester_roots']),
                            'affected_initial_ancestor_overlap': overlap(left['affected_roots'], right['affected_roots']),
                            'rl_actual_added_faces': left['actual_added_faces'],
-                           'other_actual_added_faces': right['actual_added_faces']})
+                           'other_actual_added_faces': right['actual_added_faces'],
+                           'rl_face_observations': left.get('face_observations'),
+                           'other_face_observations': right.get('face_observations')})
         if len(rl) != len(other):
             raise ValueError('Comparison branches contain different numbers of rounds')
         compared.append({'method': branch['method'], 'random_seed': branch.get('random_seed'),
@@ -114,7 +134,7 @@ def compare_branches(data):
     return {'initial_faces': initial_faces, 'comparisons': compared,
             'rl_final_metrics': reference.get('final_metrics'),
             'interpretation': 'Round 1 indices are identical; subsequent overlaps compare initial-mesh ancestors, not current face IDs. Multiple descendants collapse to one ancestor.',
-            'feature_limitation': 'Comparison logs do not contain per-face RGB, area, visibility counts or silhouettes, and later branch meshes are not saved.'}
+            'feature_limitation': 'Per-face comparison observations are available only if the run saved face_observations NPZ files; older runs cannot recover these values.'}
 
 
 def training_rounds(checkpoint):
@@ -229,7 +249,7 @@ def main():
               'training_trajectory_sha256': digest.hexdigest(),
               'comparison_policy_sha256': comparison_policy_hash,
               'comparison_used_this_trajectory': digest.hexdigest() == comparison_policy_hash if comparison_policy_hash else None,
-              'training': training_rounds(checkpoint), 'comparison': compare_branches(comparison)}
+              'training': training_rounds(checkpoint), 'comparison': compare_branches(comparison, args.comparison_dir)}
     json.dump(report, sys.stdout, indent=2, allow_nan=False)
     sys.stdout.write('\n')
 

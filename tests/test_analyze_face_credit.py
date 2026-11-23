@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
@@ -22,6 +23,19 @@ def comparison_branch(method, seed, parent, edge):
 
 
 class AnalyzeFaceCreditTest(unittest.TestCase):
+    def test_new_comparison_observations_are_summarized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'faces.npz'
+            np.savez_compressed(path, rgb_mean=[.2, .4], area=[1., 2.], visible_pixels=[4, 5],
+                                contour_near_pixels=[2, 0], min_contour_distance_pixels=[0., 6.],
+                                executed_requester=[True, False], passive=[False, True],
+                                status=['executed', 'conflict'])
+            groups = analysis.recorded_face_observations(path)
+            self.assertEqual(groups['executed_requesters']['faces'], 1)
+            self.assertAlmostEqual(groups['executed_requesters']['metrics']['rgb_mean']['mean'], .2)
+            self.assertEqual(groups['passive']['faces'], 1)
+            self.assertEqual(groups['unexecuted_requests']['faces'], 1)
+
     def test_overlap_follows_initial_ancestors(self):
         data = {'initial_faces': 2, 'branches': [
             comparison_branch('rl', None, [0, 0, 1, 1], 0),

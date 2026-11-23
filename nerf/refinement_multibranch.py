@@ -7,8 +7,9 @@ import os
 import numpy as np
 import torch
 from torch import nn
+from scipy.ndimage import binary_erosion, distance_transform_edt
 
-from nerf.refinement_experiment import _observe, _select_views, _train_branch
+from nerf.refinement_experiment import _select_views, _train_branch
 from nerf.refinement_multiround import _observe_silhouette
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256
 
@@ -64,10 +65,39 @@ def _save_json(path, value):
     os.replace(temporary, path)
 
 
+def selection_face_observations(observations, face_count, vertices, faces, radius):
+    sums = np.zeros(face_count, dtype=np.float64)
+    counts = np.zeros(face_count, dtype=np.int64)
+    near_counts = np.zeros(face_count, dtype=np.int64)
+    min_distance = np.full(face_count, np.inf)
+    contour_views = 0
+    for face_ids, losses, _, target_alpha, shape in observations:
+        valid = face_ids >= 0
+        sums += np.bincount(face_ids[valid], weights=losses[valid], minlength=face_count)
+        counts += np.bincount(face_ids[valid], minlength=face_count)
+        foreground = target_alpha.reshape(shape) > 0.5
+        boundary = foreground & ~binary_erosion(foreground, border_value=0)
+        if not boundary.any():
+            continue
+        contour_views += 1
+        distance = distance_transform_edt(~boundary).reshape(-1)
+        near = valid & (distance <= radius)
+        near_counts += np.bincount(face_ids[near], minlength=face_count)
+        np.minimum.at(min_distance, face_ids[valid], distance[valid])
+    means = np.full(face_count, np.nan)
+    np.divide(sums, counts, out=means, where=counts > 0)
+    min_distance[~np.isfinite(min_distance)] = np.nan
+    triangle = vertices[faces]
+    areas = 0.5 * np.linalg.norm(np.cross(triangle[:, 1] - triangle[:, 0],
+                                          triangle[:, 2] - triangle[:, 0]), axis=1)
+    return sums, counts, means, areas, near_counts, min_distance, contour_views
+
+
 def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_views,
                     model_state, old_vertices, old_triangles, old_v_cumsum,
                     old_f_cumsum, scaler_state, start_step):
     opt = trainer.opt
+    contour_radius = getattr(opt, 'refine_silhouette_radius', 8.0)
     if opt.refine_multiround or opt.refine_rl or opt.refine_compare_random or opt.refine_rl_eval:
         raise ValueError('Multi-branch evaluation must be used without other experiment modes')
     if opt.refine_multibranch_rounds < 1 or opt.refine_face_budget < 1:
@@ -129,6 +159,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
               'rl_selection': 'descending shared policy score among visible faces',
               'high_error_selection': 'descending average RGB error among visible faces',
               'random_selection': 'seeded permutation of visible faces', 'branches': []}
+    result['face_observations'] = ('NPZ arrays indexed by pre-update face ID; contour distance is the minimum '
+                                   'pixel distance to a ground-truth alpha > 0.5 boundary over selection views')
+    result['contour_radius_pixels'] = contour_radius
 
     branches = [('rl', None), ('high_error', None)] + [('random', seed) for seed in seeds]
     _save_json(os.path.join(opt.refine_experiment_output, 'multibranch_metadata.json'), result)
@@ -143,18 +176,15 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         branch_name = '{}_{}'.format(method, random_seed) if random_seed is not None else method
         for round_index in range(opt.refine_multibranch_rounds):
             face_count = len(model.triangles)
-            observations = _observe(trainer, val_data, selection_views)
-            sums = np.zeros(face_count, dtype=np.float64)
-            counts = np.zeros(face_count, dtype=np.float64)
-            for faces, losses, _ in observations:
-                valid = faces >= 0
-                sums += np.bincount(faces[valid], weights=losses[valid], minlength=face_count)
-                counts += np.bincount(faces[valid], minlength=face_count)
+            observations = _observe_silhouette(trainer, val_data, selection_views)
+            vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
+            faces = model.triangles.cpu().numpy()
+            sums, counts, means, areas, near_counts, min_distance, contour_views = selection_face_observations(
+                observations, face_count, vertices, faces, contour_radius)
             model.triangles_errors = torch.tensor(sums, dtype=torch.float32, device=trainer.device)
             model.triangles_errors_cnt = torch.tensor(counts, dtype=torch.float32, device=trainer.device)
             visible = np.flatnonzero(counts > 0)
             if method == 'rl' and len(visible):
-                vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
                 visible, features, _ = face_features(vertices, model.triangles.cpu().numpy(), sums, counts)
                 with torch.no_grad():
                     scores = policy(torch.from_numpy(features)).numpy()
@@ -174,12 +204,27 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             cumulative += actual
             event['global_step'] = trainer.global_step
             event['parent_face_id'] = model.parent_face_id.cpu().numpy().tolist()
+            status = np.full(face_count, 'not_visible', dtype='<U24')
+            status[visible] = 'budget_not_considered'
+            for face in order[:event['considered_count']]:
+                status[face] = event['request_status'][int(face)]
+            passive = np.zeros(face_count, dtype=bool)
+            passive[event['passive_faces']] = True
+            executed = np.zeros(face_count, dtype=bool)
+            executed[[edge['requester_face'] for edge in event['edge_events']]] = True
+            observations_file = 'faces_{}_round_{:04d}.npz'.format(branch_name, round_index + 1)
+            np.savez_compressed(os.path.join(opt.refine_experiment_output, observations_file),
+                                face_id=np.arange(face_count), rgb_mean=means, visible_pixels=counts,
+                                area=areas, contour_near_pixels=near_counts,
+                                min_contour_distance_pixels=min_distance, status=status,
+                                passive=passive, executed_requester=executed)
             _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index])
             metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
                                          evaluation_views, shapes)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
                                      'faces_after': len(model.triangles), 'visible_candidates': len(visible),
                                      'round_budget': round_budget, 'actual_added_faces': actual,
+                                     'face_observations': observations_file, 'contour_views': contour_views,
                                      'cumulative_added_faces': cumulative, 'unfilled_budget': round_budget - actual,
                                      'training_indices': training_indices[round_index],
                                      'training_seed': training_seeds[round_index], 'event': event,

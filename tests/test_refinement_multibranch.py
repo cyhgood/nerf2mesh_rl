@@ -9,11 +9,26 @@ import numpy as np
 import torch
 
 from meshutils import subdivide_longest_edges
-from nerf.refinement_multibranch import full_frame_metrics, load_trajectory_policy, run_multibranch
+from nerf.refinement_multibranch import (full_frame_metrics, load_trajectory_policy, run_multibranch,
+                                         selection_face_observations)
 from nerf.refinement_rl import FacePolicy, file_sha256
 
 
 class MultiBranchTest(unittest.TestCase):
+    def test_face_observations_raw_features_and_contour_distance(self):
+        vertices = np.array([[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]])
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        observations = [(np.array([0, 0, 1, -1]), np.array([1., 3., 4., 0.]),
+                         np.zeros(4), np.array([0., 1., 1., 0.]), (1, 4))]
+        _, counts, means, areas, near, distance, views = selection_face_observations(
+            observations, 2, vertices, faces, 0.)
+        np.testing.assert_array_equal(counts, [2, 1])
+        np.testing.assert_allclose(means, [2., 4.])
+        np.testing.assert_allclose(areas, [.5, .5])
+        np.testing.assert_array_equal(near, [1, 1])
+        np.testing.assert_allclose(distance, [0., 0.])
+        self.assertEqual(views, 1)
+
     def test_full_frame_metrics_use_same_pixels(self):
         first = [(np.array([0, -1, -1]), np.array([1., 4., 7.]), np.array([0., 1., 0.5]), None, (1, 3))]
         second = [(np.array([-1, 2, -1]), np.array([3., 2., 1.]), np.array([1., 0., 0.]), None, (1, 3))]
@@ -128,6 +143,10 @@ class MultiBranchTest(unittest.TestCase):
                 for step in branch['rounds']:
                     self.assertLessEqual(step['actual_added_faces'], step['round_budget'])
                     self.assertEqual(step['event']['added_faces'], step['actual_added_faces'])
+                    with np.load(os.path.join(directory, step['face_observations'])) as faces:
+                        self.assertEqual(len(faces['area']), step['faces_before'])
+                        self.assertEqual(len(faces['visible_pixels']), step['faces_before'])
+                        self.assertEqual(int(faces['executed_requester'].sum()), len(step['event']['edge_events']))
 
 
 if __name__ == '__main__':
