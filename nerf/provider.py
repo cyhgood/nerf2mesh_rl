@@ -326,6 +326,8 @@ class NeRFDataset:
         if self.opt.stage > 0:
             mvp = self.mvps[index].to(self.device)
             results['mvp'] = mvp
+            if self.training and getattr(self.opt, 'lambda_stage1_depth', 0) > 0:
+                results['camera_pose'] = poses
 
         if self.images is not None:
             

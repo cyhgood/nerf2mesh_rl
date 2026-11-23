@@ -101,12 +101,17 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
     trainer.optimizer = trainer.optimizer_fn(trainer.model)
     trainer.lr_scheduler = trainer.lr_scheduler_fn(trainer.optimizer)
     silhouette_losses = []
+    depth_losses = []
+    depth_valid_pixels = []
     for index in indices:
         trainer.global_step += 1
         trainer.optimizer.zero_grad()
         _, _, loss = trainer.train_step(dataset.collate([int(index)]))
         if getattr(trainer, 'loss_sil', None) is not None:
             silhouette_losses.append(float(trainer.loss_sil.item()))
+        if getattr(trainer, 'loss_stage1_depth', None) is not None:
+            depth_losses.append(float(trainer.loss_stage1_depth.item()))
+            depth_valid_pixels.append(trainer.stage1_depth_valid_count)
         trainer.scaler.scale(loss).backward()
         trainer.post_train_step()
         norms = None
@@ -129,7 +134,9 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
                               step_finite and trainer.scaler.get_scale() >= old_scale)
         trainer.lr_scheduler.step()
     return {'loss_sil_steps': silhouette_losses,
-            'loss_sil_mean': float(np.mean(silhouette_losses)) if silhouette_losses else None}
+            'loss_sil_mean': float(np.mean(silhouette_losses)) if silhouette_losses else None,
+            'loss_depth_steps': depth_losses, 'depth_valid_pixels': depth_valid_pixels,
+            'loss_depth_mean': float(np.mean(depth_losses)) if depth_losses else None}
 
 
 def _warmup_vertex_ema(trainer, dataset, vertex_state, steps, beta, seed):

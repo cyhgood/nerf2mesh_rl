@@ -283,6 +283,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
                         'refine_multiround_horizon', 'refine_silhouette_radius'}
     config['options'] = {key: value for key, value in vars(opt).items() if key not in excluded_options}
+    if getattr(opt, 'lambda_stage1_depth', 0) > 0:
+        from nerf.stage1_depth import Stage1DepthSource
+        config['stage1_depth_source'] = Stage1DepthSource(opt.stage1_depth_manifest).describe()
     model = trainer.model
     torch.manual_seed(opt.seed)
     policy = CandidatePolicy()
@@ -309,8 +312,17 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             # A new segment may intentionally use a different mesh loss.
             old_options.pop('lambda_sil', None)
             requested_options.pop('lambda_sil', None)
+            for key in ('lambda_stage1_depth', 'stage1_depth_manifest'):
+                old_options.pop(key, None)
+                requested_options.pop(key, None)
+            old_config.pop('stage1_depth_source', None)
+            requested_config.pop('stage1_depth_source', None)
         elif 'lambda_sil' not in old_options and requested_options.get('lambda_sil', 0) == 0:
             requested_options.pop('lambda_sil', None)
+        if not saved['completed'] and 'lambda_stage1_depth' not in old_options and requested_options.get('lambda_stage1_depth', 0) == 0:
+            requested_options.pop('lambda_stage1_depth', None)
+            if not requested_options.get('stage1_depth_manifest', ''):
+                requested_options.pop('stage1_depth_manifest', None)
         old_config['options'], requested_config['options'] = old_options, requested_options
         old_config.pop('rounds')
         requested_config.pop('rounds')

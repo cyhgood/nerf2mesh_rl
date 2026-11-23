@@ -116,8 +116,16 @@ class SilhouetteTest(unittest.TestCase):
                                         glctx=None, individual_dim=0,
                                         rgb=lambda xyz, dirs, code, shading: (torch.ones_like(xyz), None))
                 rays = torch.ones(4, 3)
-                outputs = render(model, rays, rays, torch.eye(4), 2, 2)
+                camera = torch.eye(4)
+                camera[2, 3] = 3
+                outputs = render(model, rays, rays, torch.eye(4), 2, 2,
+                                 depth_definition='camera_z', camera_pose=camera)
                 self.assertEqual(outputs['alpha'].shape, (4,))
+                torch.testing.assert_close(outputs['surface_depth'], torch.full((4,), 2.))
+                self.assertTrue(outputs['surface_depth_hit'].all())
+                ray_outputs = render(model, rays, rays, torch.eye(4), 2, 2,
+                                     depth_definition='ray_distance', camera_pose=camera)
+                torch.testing.assert_close(ray_outputs['surface_depth'], torch.full((4,), 6 ** .5))
                 self.assertFalse(model.refinement_alpha.requires_grad)
                 loss = stage1_silhouette_loss(outputs['alpha'], torch.zeros(4, 4), {})
                 loss.backward()
@@ -146,9 +154,19 @@ class SilhouetteTest(unittest.TestCase):
                                             glctx=context, individual_dim=0,
                                             rgb=lambda xyz, dirs, code, shading: (torch.ones_like(xyz), None))
                     rays = torch.ones(16 * 16, 3, device='cuda')
-                    outputs = render(model, rays, rays, torch.eye(4, device='cuda'), 16, 16)
+                    camera = torch.eye(4, device='cuda')
+                    camera[2, 3] = 2.
+                    outputs = render(model, rays, rays, torch.eye(4, device='cuda'), 16, 16,
+                                     depth_definition='camera_z', camera_pose=camera)
                     self.assertEqual(outputs['alpha'].shape, (256,))
                     self.assertFalse(model.refinement_alpha.requires_grad)
+                    self.assertTrue(outputs['surface_depth_hit'].any())
+                    torch.testing.assert_close(outputs['surface_depth'][outputs['surface_depth_hit']],
+                                               torch.full_like(outputs['surface_depth'][outputs['surface_depth_hit']], 2.))
+                    depth_grad = torch.autograd.grad(outputs['surface_depth'][outputs['surface_depth_hit']].mean(),
+                                                     offsets, retain_graph=True)[0]
+                    self.assertTrue(torch.isfinite(depth_grad).all())
+                    self.assertGreater(depth_grad.abs().sum().item(), 0.)
                     loss = stage1_silhouette_loss(outputs['alpha'], torch.zeros(256, 4, device='cuda'), {})
                     loss.backward()
                     self.assertTrue(torch.isfinite(offsets.grad).all())

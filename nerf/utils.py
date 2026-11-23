@@ -31,6 +31,7 @@ from torch_ema import ExponentialMovingAverage
 from packaging import version as pver
 import lpips
 from nerf.silhouette_loss import stage1_silhouette_loss
+from nerf.stage1_depth import Stage1DepthSource, stage1_depth_loss
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -630,6 +631,8 @@ class Trainer(object):
     def train_step(self, data):
 
         self.loss_sil = None
+        self.loss_stage1_depth = None
+        self.stage1_depth_valid_count = None
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         index = data['index'] # [1/N]
@@ -698,7 +701,21 @@ class Trainer(object):
         else:
             mvp = data['mvp'].squeeze(0) # [4, 4]
             H, W = data['H'], data['W']
-            outputs = self.model.render_stage1(rays_o, rays_d, mvp, H, W, bg_color=bg_color, shading=shading, **vars(self.opt))
+            depth_options = {}
+            if getattr(self.opt, 'lambda_stage1_depth', 0) > 0:
+                if getattr(self.opt, 'data_format', 'nerf') != 'nerf' or getattr(self.opt, 'train_split', 'train') != 'train':
+                    raise ValueError('Stage 1 depth manifest currently supports only nerf train split')
+                if not getattr(self.opt, 'stage1_depth_manifest', ''):
+                    raise ValueError('Set --stage1_depth_manifest when enabling Stage 1 depth')
+                if not hasattr(self, 'stage1_depth_source'):
+                    self.stage1_depth_source = Stage1DepthSource(self.opt.stage1_depth_manifest)
+                    self.log('[INFO] Stage 1 depth source: {}'.format(self.stage1_depth_source.describe()))
+                if 'camera_pose' not in data:
+                    raise ValueError('Stage 1 depth needs the training camera pose')
+                target_depth, target_valid = self.stage1_depth_source.load(index[0], (H, W), self.device)
+                depth_options = {'depth_definition': self.stage1_depth_source.metadata['definition'],
+                                 'camera_pose': data['camera_pose']}
+            outputs = self.model.render_stage1(rays_o, rays_d, mvp, H, W, bg_color=bg_color, shading=shading, **depth_options, **vars(self.opt))
 
             pred_rgb = outputs['image']
             loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [H, W]
@@ -724,6 +741,11 @@ class Trainer(object):
                     loss = loss + self.opt.lambda_specular * (specs ** 2).sum(-1).mean()
  
         if self.opt.stage == 1:
+            if getattr(self.opt, 'lambda_stage1_depth', 0) > 0:
+                loss_depth, valid_count = stage1_depth_loss(outputs['surface_depth'], outputs['surface_depth_hit'], target_depth, target_valid)
+                self.loss_stage1_depth = loss_depth.detach()
+                self.stage1_depth_valid_count = valid_count
+                loss = loss + self.opt.lambda_stage1_depth * loss_depth
             lambda_sil = getattr(self.opt, 'lambda_sil', 0.0)
             if lambda_sil > 0:
                 loss_sil = stage1_silhouette_loss(outputs['alpha'], images, data)
@@ -1170,6 +1192,9 @@ class Trainer(object):
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     if self.loss_sil is not None:
                         self.writer.add_scalar("train/loss_sil", self.loss_sil.item(), self.global_step)
+                    if self.loss_stage1_depth is not None:
+                        self.writer.add_scalar("train/loss_stage1_depth", self.loss_stage1_depth.item(), self.global_step)
+                        self.writer.add_scalar("train/stage1_depth_valid_pixels", self.stage1_depth_valid_count, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:

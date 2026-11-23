@@ -1,5 +1,6 @@
 import torch
 import argparse
+import math
 
 from nerf.gui import NeRFGUI
 from nerf.network import NeRFNetwork
@@ -84,6 +85,8 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_lpips', type=float, default=0, help="loss scale")
     parser.add_argument('--lambda_offsets', type=float, default=0.1, help="loss scale")#顶点偏移L2正则化
     parser.add_argument('--lambda_sil', type=float, default=0, help='Stage 1 full-image silhouette L1 loss weight')
+    parser.add_argument('--lambda_stage1_depth', type=float, default=0, help='Stage 1 valid surface depth L1 weight (default disabled)')
+    parser.add_argument('--stage1_depth_manifest', default='', help='explicit training-view float NPY depth manifest')
     parser.add_argument('--lambda_lap', type=float, default=0.001, help="loss scale")#拉普拉斯平滑损失
     parser.add_argument('--lambda_normal', type=float, default=0, help="loss scale")#法向一致性损失
     parser.add_argument('--lambda_edgelen', type=float, default=0, help="loss scale")
@@ -163,6 +166,11 @@ if __name__ == '__main__':
     parser.add_argument('--max_spp', type=int, default=1, help="GUI rendering max sample per pixel")
 
     opt = parser.parse_args()
+
+    if not math.isfinite(opt.lambda_stage1_depth) or opt.lambda_stage1_depth < 0:
+        parser.error('--lambda_stage1_depth must be finite and nonnegative')
+    if opt.lambda_stage1_depth > 0 and (opt.stage != 1 or not opt.stage1_depth_manifest):
+        parser.error('Stage 1 depth requires --stage 1 and --stage1_depth_manifest')
 
     opt.cuda_ray = True
 

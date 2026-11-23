@@ -926,12 +926,14 @@ class NeRFRenderer(nn.Module):#
         #五、保存最终结果
         results['depth'] = depth
         results['image'] = image
+        results['weights_sum'] = weights_sum.view(*prefix)
         return results
     
     # phase 2 mesh光栅化渲染
     #先将当前三角网格光栅化到图像平面，再利用 NeRF 网络预测网格表面的颜色，最后得到渲染图像、深度和三角形索引
     #1.函数输入 MVP:	Model-View-Projection 模型视图投影矩阵 h0:原始图像高度 w0:原始图像宽度
-    def render_stage1(self, rays_o, rays_d, mvp, h0, w0, index=None, bg_color=None, shading='full', **kwargs):
+    def render_stage1(self, rays_o, rays_d, mvp, h0, w0, index=None, bg_color=None, shading='full',
+                      depth_definition=None, camera_pose=None, **kwargs):
         #2.保存图像原始形状
         prefix = rays_d.shape[:-1]
         #3.展平观察方向 [H, W, 3] → [H×W, 3] 每个像素对应一个观察方向
@@ -1005,6 +1007,21 @@ class NeRFRenderer(nn.Module):#
         #15.插值得到物体掩码 给每个顶点设置值 1，然后插值得到像素掩码 [1, H, W, 1]
         #mask > 0：像素落在网格表面 mask = 0：像素没有被网格覆盖
         mask, _ = dr.interpolate(torch.ones_like(vertices[:, :1]).unsqueeze(0), rast, self.triangles) # [1, H, W, 1]
+        if depth_definition is not None:
+            if depth_definition not in ('camera_z', 'ray_distance') or camera_pose is None:
+                raise ValueError('Stage 1 metric depth requires a camera pose and explicit definition')
+            camera = camera_pose.reshape(-1, 4, 4)[0].float()
+            displacement = xyzs[0].float() - camera[:3, 3]
+            if depth_definition == 'camera_z':
+                surface_depth = (displacement * -camera[:3, 2]).sum(-1, keepdim=True)
+            else:
+                surface_depth = torch.linalg.vector_norm(displacement, dim=-1, keepdim=True)
+            surface_hit = mask[0] > 0
+            if self.opt.ssaa > 1:
+                surface_depth = scale_img_hwc(surface_depth, (h0, w0), mag='nearest', min='nearest')
+                surface_hit = scale_img_hwc(surface_hit.float(), (h0, w0), mag='nearest', min='nearest') > 0
+            results['surface_depth'] = surface_depth.reshape(*prefix)
+            results['surface_depth_hit'] = surface_hit.reshape(*prefix)
         #16.展平掩码和三维坐标  后面只对网格覆盖的像素计算颜色
         mask_flatten = (mask > 0).view(-1) #[H*W]
         xyzs = xyzs.view(-1, 3) #[H*W,3]
