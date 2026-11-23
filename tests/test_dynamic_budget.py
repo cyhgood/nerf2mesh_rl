@@ -23,9 +23,10 @@ class DynamicBudgetTest(unittest.TestCase):
             return face != 2
         _, faces, parents, event = subdivide_longest_edges(
             self.vertices, self.faces, [True] * 5, True, np.arange(5), 3, decide)
-        self.assertEqual(observed, [(0, 3), (1, 1), (2, 1), (3, 1), (4, 0)])
+        self.assertEqual(observed, [(0, 3), (1, 1), (2, 1), (3, 1)])
         self.assertEqual(event['request_status'], {0: 'executed', 1: 'conflict', 2: 'hold',
-                                                   3: 'executed', 4: 'budget'})
+                                                   3: 'executed', 4: 'budget_not_considered'})
+        self.assertEqual(event['considered_count'], 4)
         self.assertEqual(event['added_faces'], 3)
         self.assertEqual(len(faces) - len(self.faces), 3)
         self.assertEqual(np.bincount(parents, minlength=5).tolist(), [2, 2, 1, 2, 1])
@@ -55,7 +56,9 @@ class DynamicBudgetTest(unittest.TestCase):
         np.testing.assert_array_equal(train.features, evaluation.features)
         np.testing.assert_array_equal(train.actions, evaluation.actions)
         self.assertEqual(result_a[3]['request_status'], result_b[3]['request_status'])
-        np.testing.assert_allclose(train.features[train.decided, 6], [1., 1/3, 1/3, 0., 0.], rtol=1e-6)
+        np.testing.assert_allclose(train.features[train.decided, 6], [1., 1/3, 1/3], rtol=1e-6)
+        np.testing.assert_array_equal(train.decided, [True, True, True, False, False])
+        self.assertTrue(np.isnan(train.log_probabilities[~train.decided]).all())
         self.assertTrue(np.isfinite(train.log_probabilities[train.decided]).all())
         selected = torch.from_numpy(train.features[train.decided])
         sampled = torch.from_numpy(train.actions[train.decided].astype(np.float32))
@@ -65,9 +68,29 @@ class DynamicBudgetTest(unittest.TestCase):
         empty_budget = SequentialFaceDecisions(AlwaysRequest(), np.arange(5), features, 0, deterministic=True)
         _, _, _, event = subdivide_longest_edges(self.vertices, self.faces, [True] * 5, True,
                                                  np.arange(5), 0, empty_budget)
-        self.assertTrue(empty_budget.decided.all())
+        self.assertFalse(empty_budget.decided.any())
         np.testing.assert_array_equal(empty_budget.features[:, 6], np.zeros(5))
         self.assertEqual(event['added_faces'], 0)
+        self.assertEqual(event['considered_count'], 0)
+        self.assertEqual(set(event['request_status'].values()), {'budget_not_considered'})
+
+    def test_undecided_faces_do_not_contribute_to_loss(self):
+        class IndependentPolicy(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.logits = torch.nn.Parameter(torch.zeros(3))
+            def forward(self, features):
+                return self.logits
+        policy = IndependentPolicy()
+        transition = {'visible': np.arange(3), 'features': np.zeros((3, 9), dtype=np.float32),
+                      'actions': np.array([True, False, False]),
+                      'decision_mask': np.array([True, True, False]),
+                      'event': {'passive_faces': [], 'edge_events': []}}
+        loss = face_policy_losses(policy, [transition], [np.array([2., 1., 1e9])])[0]
+        loss.backward()
+        torch.testing.assert_close(policy.logits.grad, torch.tensor([-1., .5, 0.]))
+        transition['decision_mask'][:] = False
+        self.assertIsNone(face_policy_losses(policy, [transition], [np.ones(3)])[0])
 
     def test_gradient_uses_recorded_budget_and_passive_return(self):
         class BudgetPolicy(torch.nn.Module):

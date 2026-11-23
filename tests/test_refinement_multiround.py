@@ -294,6 +294,27 @@ class MultiRoundTest(unittest.TestCase):
             pending = torch.load(os.path.join(paths[1], 'trajectory.pt'), map_location='cpu')
             self.assertFalse(pending['completed'])
             self.assertEqual(len(pending['transitions']), 3)
+            old_open = copy.deepcopy(pending)
+            old_open['config']['policy_objective'] = 'candidate_sequential_budget_v4'
+            old_open_path = os.path.join(directory, 'old_dynamic_open.pt')
+            torch.save(old_open, old_open_path)
+            old_open_trainer = make_trainer(paths[2], ckpt, mesh, old_open_path)
+            old_open_trainer.opt.refine_multiround_horizon = 6
+            with self.assertRaisesRegex(ValueError, 'open segment from a different policy objective'):
+                refinement_multiround.run_multiround(old_open_trainer, Dataset(), Dataset(), [0], [1])
+            old_completed = copy.deepcopy(full_state)
+            old_completed['config']['policy_objective'] = 'candidate_sequential_budget_v4'
+            old_completed_path = os.path.join(directory, 'old_dynamic_completed.pt')
+            torch.save(old_completed, old_completed_path)
+            old_completed_dir = os.path.join(directory, 'old_dynamic_continued')
+            os.mkdir(old_completed_dir)
+            old_trainer = make_trainer(old_completed_dir, ckpt, mesh, old_completed_path)
+            old_trainer.opt.refine_multiround_rounds = 1
+            refinement_multiround.run_multiround(old_trainer, Dataset(), Dataset(), [0], [1])
+            old_resumed = torch.load(os.path.join(old_completed_dir, 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(len(old_resumed['policy_optimizer']['state']), 0)
+            for key in old_completed['policy']:
+                torch.testing.assert_close(old_completed['policy'][key], old_resumed['policy'][key])
             corrupt = copy.deepcopy(pending)
             corrupt['vertex_gradient_ema'] = corrupt['vertex_gradient_ema'][:-1]
             corrupt_path = os.path.join(directory, 'corrupt_ema.pt')

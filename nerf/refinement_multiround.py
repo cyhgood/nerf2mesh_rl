@@ -16,7 +16,7 @@ from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candid
 from nerf.refinement_attribution import edge_outcomes
 
 
-POLICY_OBJECTIVE = 'candidate_sequential_budget_v4'
+POLICY_OBJECTIVE = 'candidate_sequential_budget_stop_v5'
 
 
 def edge_costs(event, face_count):
@@ -276,7 +276,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'lineage_weights': 'child area after optimization normalized over each parent',
               'cost_allocation': 'all faces added by an edge charged once to its first executing requester',
               'policy_objective': POLICY_OBJECTIVE,
-              'budget_decision_mode': 'area order, sequential remaining/per-round budget',
+              'budget_decision_mode': 'area order, sequential remaining/per-round budget, stop sampling at zero',
               'feature_version': FEATURE_VERSION,
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
               'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
