@@ -54,17 +54,40 @@ def executed_rewards(event, parent, before, after, control, face_count):
     return rewards, counts, before_error, after_error, control_error
 
 
-def policy_update(policy, optimizer, features, actions, visible, rewards):
-    positions = [i for i, face in enumerate(visible) if int(face) in rewards and actions[i]]
-    if not positions:
+def policy_update(policy, optimizer, features, order, considered_count, reward):
+    """REINFORCE for a Plackett-Luce ordering stopped by the mesh budget."""
+    if not considered_count or reward is None:
         return None
-    logits = policy(features[positions])
-    advantages = torch.tensor([rewards[int(visible[i])] for i in positions], dtype=logits.dtype)
-    loss = -(torch.nn.functional.logsigmoid(logits) * advantages).mean()
+    logits = policy(features)[order]
+    denominators = torch.logcumsumexp(logits.flip(0), dim=0).flip(0)
+    log_probability = (logits[:considered_count] - denominators[:considered_count]).sum()
+    loss = -log_probability * float(reward)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
     return float(loss.detach())
+
+
+def policy_order(logits, generator, mode):
+    if mode == 'sample':
+        uniform = torch.rand(logits.shape, generator=generator, dtype=torch.float64)
+        uniform.clamp_(min=torch.finfo(torch.float64).tiny)
+        return torch.argsort(logits.double() - torch.log(-torch.log(uniform)), descending=True)
+    if mode == 'rank':
+        return torch.argsort(logits, descending=True, stable=True)
+    if mode == 'threshold':
+        return torch.nonzero(torch.sigmoid(logits) >= 0.5, as_tuple=False).view(-1)
+    raise ValueError('Unknown policy selection mode')
+
+
+def fixed_region_reward(before, after, control, face_count):
+    counts, _ = _fixed_region_means(before, before, face_count)
+    _, after_error = _fixed_region_means(before, after, face_count)
+    _, control_error = _fixed_region_means(before, control, face_count)
+    observed = counts > 0
+    if not observed.any():
+        return None
+    return float(np.average(control_error[observed] - after_error[observed], weights=counts[observed]))
 
 
 def file_sha256(path):
@@ -79,7 +102,8 @@ def save_policy(path, policy, optimizer, generator, round_number, provenance):
     temporary_path = path + '.tmp'
     torch.save({'policy': policy.state_dict(), 'optimizer': optimizer.state_dict(),
                 'generator_state': generator.get_state(), 'round': round_number,
-                'provenance': provenance, 'feature_description': FEATURE_DESCRIPTION}, temporary_path)
+                'provenance': provenance, 'feature_description': FEATURE_DESCRIPTION,
+                'algorithm': 'plackett_luce_budget_v1'}, temporary_path)
     os.replace(temporary_path, path)
 
 
@@ -91,7 +115,8 @@ def load_policy(path, policy, optimizer, generator, provenance):
     if checkpoint.get('feature_description') != FEATURE_DESCRIPTION:
         raise ValueError('Policy checkpoint feature definition differs')
     policy.load_state_dict(checkpoint['policy'])
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    if checkpoint.get('algorithm') == 'plackett_luce_budget_v1':
+        optimizer.load_state_dict(checkpoint['optimizer'])
     generator.set_state(checkpoint['generator_state'])
     return checkpoint['round']
 
@@ -154,10 +179,12 @@ def run_refinement_rl(trainer, train_data, val_data, selection_views, evaluation
                     loaded_policy=os.path.abspath(opt.refine_rl_checkpoint) if opt.refine_rl_checkpoint else None,
                     loaded_policy_sha256=file_sha256(opt.refine_rl_checkpoint) if opt.refine_rl_checkpoint else None,
                     stage1_global_step=start_step, feature_description=FEATURE_DESCRIPTION,
-                    feature_scales=scales.tolist(), algorithm='REINFORCE, successful requests only',
-                    reward='control minus refined RGB SmoothL1 on fixed pre-update face pixels',
-                    excluded_from_policy_update='hold, passive, conflict, budget and reward-unobserved faces',
-                    action_order='random permutation of requests for training, face index order for evaluation',
+                    feature_scales=scales.tolist(), algorithm='Plackett-Luce budget-stopped REINFORCE',
+                    reward='pixel-weighted control minus refined RGB SmoothL1 on all fixed pre-update face pixels',
+                    action_order='Gumbel-sampled weighted order for training; rank or threshold for evaluation',
+                    score_interpretation='probability is legacy sigmoid score; initial_selection_weight is softmax first-draw probability',
+                    eval_mode=getattr(opt, 'refine_rl_eval_mode', 'rank'),
+                    legacy_checkpoint_optimizer='reset when loaded checkpoint predates plackett_luce_budget_v1',
                     checkpoint_limit='input mesh and Stage 1 checkpoint topology correspondence is not verified')
     with open(os.path.join(opt.refine_experiment_output, 'rl_metadata.json'), 'x') as output:
         json.dump(metadata, output, indent=2, allow_nan=False)
@@ -165,14 +192,12 @@ def run_refinement_rl(trainer, train_data, val_data, selection_views, evaluation
     for iteration in range(opt.refine_rl_rounds):
         restore()
         with torch.no_grad():
-            probabilities = torch.sigmoid(policy(features))
-            if opt.refine_rl_eval:
-                actions = probabilities >= 0.5
-            else:
-                actions = torch.rand(len(visible), generator=generator) < probabilities
-            requested = visible[actions.numpy()]
-            if not opt.refine_rl_eval:
-                requested = requested[torch.randperm(len(requested), generator=generator).numpy()]
+            logits = policy(features)
+            probabilities = torch.sigmoid(logits)
+            selection_weights = torch.softmax(logits, dim=0)
+            mode = getattr(opt, 'refine_rl_eval_mode', 'rank') if opt.refine_rl_eval else 'sample'
+            order = policy_order(logits, generator, mode)
+            requested = visible[order.numpy()]
         model.refine_and_decimate(export_mesh=False, candidate_order=requested,
                                   max_added_faces=opt.refine_face_budget)
         event = copy.deepcopy(model.refinement_event)
@@ -180,25 +205,38 @@ def run_refinement_rl(trainer, train_data, val_data, selection_views, evaluation
         actual_added = len(model.triangles) - face_count
         if actual_added != event['added_faces']:
             raise RuntimeError('Recorded face budget does not match the resulting topology')
+        considered_count = event['considered_count']
+        for face in requested[considered_count:]:
+            event['request_status'][int(face)] = 'budget_not_considered'
+        considered_faces = set(map(int, requested[:considered_count]))
         _train_branch(trainer, train_data, indices, opt.seed)
         after_reward = _observe(trainer, val_data, reward_views)
         after_eval = _observe(trainer, val_data, evaluation_views)
         rewards, reward_counts, baseline, after, control = executed_rewards(
             event, parent, before_reward, after_reward, control_reward, face_count)
-        loss = None if opt.refine_rl_eval else policy_update(policy, optimizer, features, actions, visible, rewards)
+        global_reward = fixed_region_reward(before_reward, after_reward, control_reward, face_count)
+        loss = None if opt.refine_rl_eval else policy_update(policy, optimizer, features, order, considered_count, global_reward)
         by_view, overall = _foreground_errors(before_eval, after_eval, control_eval, evaluation_views)
         statuses = event['request_status']
+        summary = np.quantile(probabilities.numpy(), [0, 0.25, 0.5, 0.75, 1]).tolist()
         record = {'round': start_round + iteration + 1, 'global_step': start_step,
-                  'requested_count': int(actions.sum()), 'hold_count': int(len(visible) - actions.sum()),
+                  'selection_mode': mode, 'visible_candidate_count': len(visible),
+                  'ranked_candidate_count': len(order), 'considered_count': considered_count,
+                  'sigmoid_score_quantiles': dict(zip(['min', 'q25', 'median', 'q75', 'max'], summary)),
+                  'initial_selection_weight_min': float(selection_weights.min()),
+                  'initial_selection_weight_max': float(selection_weights.max()),
+                  'requested_count': considered_count, 'hold_count': int(len(visible) - considered_count),
                   'executed_count': sum(s == 'executed' for s in statuses.values()),
+                  'executed_edge_count': len(event['executed_edges']),
                   'conflict_count': sum(s == 'conflict' for s in statuses.values()),
-                  'budget_skipped_count': sum(s == 'budget' for s in statuses.values()),
+                  'budget_skipped_count': sum(s in ('budget', 'budget_not_considered') for s in statuses.values()),
                   'actual_added_faces': actual_added, 'mean_reward': float(np.mean(list(rewards.values()))) if rewards else None,
-                  'reward_count': len(rewards), 'policy_loss': loss, 'event': event,
+                  'global_reward': global_reward, 'reward_count': len(rewards), 'policy_loss': loss, 'event': event,
                   'parent_face_id': parent.tolist(), 'foreground_errors_by_view': by_view,
                   'foreground_errors_overall': overall,
                   'decisions': [{'face_id': int(face), 'probability': float(probabilities[i]),
-                                 'requested': bool(actions[i]),
+                                 'requested': int(face) in considered_faces,
+                                 'initial_selection_weight': float(selection_weights[i]),
                                  'status': statuses.get(int(face), 'passive' if int(face) in event['passive_faces'] else 'hold'),
                                  'passively_split': int(face) in event['passive_faces'],
                                  'reward_pixels': int(reward_counts[face]),

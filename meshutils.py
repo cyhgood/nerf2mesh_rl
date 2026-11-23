@@ -224,12 +224,14 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     processed = []
     added_faces = 0
     additions = []
+    considered_count = 0
     for face_id in candidate_order:
         if max_added_faces is not None and added_faces >= max_added_faces:
             processed.append(int(face_id))
             request_status[int(face_id)] = 'budget'
             continue
         processed.append(int(face_id))
+        considered_count += 1
         face = faces[face_id]
         edges = [(int(face[i]), int(face[(i + 1) % 3])) for i in range(3)]
         lengths = [np.sum((verts[a] - verts[b]) ** 2) for a, b in edges]
@@ -282,6 +284,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
                           'request_status': request_status,
                           'executed_edges': executed_edges,
                           'passive_faces': passive, 'added_faces': added_faces,
+                          'considered_count': considered_count,
                           'cumulative_added_faces': additions},)
     return result
 

@@ -124,6 +124,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_rl_lr', type=float, default=0.001, help='policy optimizer learning rate')
     parser.add_argument('--refine_rl_checkpoint', type=str, default='', help='load policy checkpoint')
     parser.add_argument('--refine_rl_eval', action='store_true', help='evaluate a loaded policy without updates')
+    parser.add_argument('--refine_rl_eval_mode', choices=['rank', 'threshold'], default='rank', help='rank all visible faces or request only faces with sigmoid probability >= 0.5')
     parser.add_argument('--refine_experiment_output', type=str, default='', help='output directory for the refinement experiment')
     parser.add_argument("--refine_steps_ratio", type=float, action="append", default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.7])
     parser.add_argument('--refine_size', type=float, default=0.01, help="refine trig length")
