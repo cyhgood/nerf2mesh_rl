@@ -13,7 +13,7 @@ from nerf.refinement_multiround import (edge_costs, lineage_returns, local_rewar
                                         _silhouette_owners, face_policy_losses, reward_distributions, action_counts,
                                         grouped_rewards)
 from nerf import refinement_multiround
-from nerf.refinement_rl import FacePolicy
+from nerf.refinement_candidates import CandidatePolicy
 
 
 class MultiRoundTest(unittest.TestCase):
@@ -40,12 +40,12 @@ class MultiRoundTest(unittest.TestCase):
         policy = Logits()
         transition = {'features': np.zeros((3, 3), dtype=np.float32), 'visible': np.arange(3),
                       'selection_order': np.array([0, 1, 2]), 'considered_count': 2,
+                      'actions': np.array([True, True, False]),
                       'event': {'request_status': {0: 'executed', 1: 'conflict', 2: 'budget_not_considered'},
                                 'considered_count': 2, 'executed_edges': [[0, 1]]}}
-        losses = face_policy_losses(policy, [transition], [np.array([2., -1., 100.])])
+        losses = face_policy_losses(policy, [transition], [np.array([2., -1., np.nan])])
         losses[0].backward()
-        # Face 2 is unconsidered, but affects both Plackett-Luce denominators.
-        torch.testing.assert_close(policy.values.grad, torch.tensor([-4/3, 7/6, 1/6]))
+        torch.testing.assert_close(policy.values.grad, torch.tensor([-1., .5, 0.]))
         counts = action_counts(transition)
         self.assertEqual(counts['executed_request_count'], 1)
         self.assertEqual(counts['conflict_count'], 1)
@@ -53,9 +53,9 @@ class MultiRoundTest(unittest.TestCase):
         transition['event']['request_status'][1] = 'budget'
         self.assertEqual(action_counts(transition)['budget_rejected_count'], 1)
         policy.zero_grad()
-        losses = face_policy_losses(policy, [transition], [np.array([2., 1., 100.])])
+        losses = face_policy_losses(policy, [transition], [np.array([2., 1., 2.])])
         losses[0].backward()
-        torch.testing.assert_close(policy.values.grad, torch.tensor([-4/3, 1/6, 7/6]))
+        torch.testing.assert_close(policy.values.grad, torch.tensor([-1., -.5, 1.]))
 
     def test_reward_components_distribution(self):
         transition = {'reward_pixels': np.array([2, 1, 0]), 'sil_before': np.array([.5, .8, 0]),
@@ -69,9 +69,10 @@ class MultiRoundTest(unittest.TestCase):
         self.assertEqual(result['lineage_return']['count'], 2)
 
     def test_advantages_after_returns_and_clipping(self):
-        policy = FacePolicy()
-        transition = {'features': np.ones((3, 3), dtype=np.float32), 'visible': np.arange(3),
+        policy = CandidatePolicy()
+        transition = {'features': np.ones((3, 9), dtype=np.float32), 'visible': np.arange(3),
                       'selection_order': np.arange(3), 'considered_count': 3}
+        transition['actions'] = np.array([True, False, True])
         raw = np.array([1., 2., 100.])
         _, stats = face_policy_losses(policy, [transition], [raw], 'mean', 'std', .5, True)
         self.assertAlmostEqual(stats[0]['baseline'], raw.mean())
@@ -218,12 +219,15 @@ class MultiRoundTest(unittest.TestCase):
             full_state = torch.load(os.path.join(full_dir, 'trajectory.pt'), map_location='cpu')
             resumed_state = torch.load(os.path.join(resumed_dir, 'trajectory.pt'), map_location='cpu')
             torch.manual_seed(42)
-            initial = FacePolicy().state_dict()
+            initial = CandidatePolicy().state_dict()
             self.assertTrue(any(not torch.equal(initial[key], full_state['policy'][key]) for key in initial))
             self.assertEqual(full_state['global_step'], 3)
             self.assertEqual(resumed_state['global_step'], 3)
             torch.testing.assert_close(full_state['vertices'], resumed_state['vertices'])
             torch.testing.assert_close(full_state['triangles'], resumed_state['triangles'])
+            np.testing.assert_allclose(full_state['vertex_gradient_ema'], resumed_state['vertex_gradient_ema'])
+            np.testing.assert_array_equal(full_state['vertex_gradient_seen'], resumed_state['vertex_gradient_seen'])
+            self.assertEqual(len(resumed_state['vertex_mapping']), len(resumed_state['vertices']))
             for key in full_state['policy']:
                 torch.testing.assert_close(full_state['policy'][key], resumed_state['policy'][key])
             self.assertEqual(len(resumed_state['transitions']), 3)
@@ -240,6 +244,7 @@ class MultiRoundTest(unittest.TestCase):
             legacy['config'].pop('horizon')
             legacy['config'].pop('silhouette_radius')
             legacy['config'].pop('policy_objective')
+            legacy['config'].pop('feature_version')
             legacy['config'].pop('advantage_config')
             legacy['config'].pop('lineage_missing_rule')
             for key in ('refine_advantage_baseline', 'refine_advantage_scale', 'refine_advantage_clip'):
@@ -251,10 +256,14 @@ class MultiRoundTest(unittest.TestCase):
             os.mkdir(legacy_dir)
             legacy_trainer = make_trainer(legacy_dir, ckpt, mesh, legacy_path)
             legacy_trainer.opt.refine_multiround_rounds = 1
+            with self.assertRaisesRegex(ValueError, 'incompatible input dimensions'):
+                refinement_multiround.run_multiround(legacy_trainer, Dataset(), Dataset(), [0], [1])
+            legacy_trainer.opt.refine_reinitialize_legacy_policy = True
             refinement_multiround.run_multiround(legacy_trainer, Dataset(), Dataset(), [0], [1])
             restored = torch.load(os.path.join(legacy_dir, 'trajectory.pt'), map_location='cpu')
             self.assertEqual(len(restored['history']), 3)
             self.assertEqual(restored['transitions'][0]['round'], 4)
+            self.assertEqual(restored['ema_initialization'], 'legacy_mesh_zero_ema_and_reinitialized_policy')
             self.assertEqual(len(restored['policy_optimizer']['state']), 0)
             # A six-round segment resumed after round three matches an uninterrupted segment.
             paths = [os.path.join(directory, name) for name in ('full_six', 'first_three', 'last_three')]
@@ -270,6 +279,16 @@ class MultiRoundTest(unittest.TestCase):
             pending = torch.load(os.path.join(paths[1], 'trajectory.pt'), map_location='cpu')
             self.assertFalse(pending['completed'])
             self.assertEqual(len(pending['transitions']), 3)
+            corrupt = copy.deepcopy(pending)
+            corrupt['vertex_gradient_ema'] = corrupt['vertex_gradient_ema'][:-1]
+            corrupt_path = os.path.join(directory, 'corrupt_ema.pt')
+            torch.save(corrupt, corrupt_path)
+            corrupt_dir = os.path.join(directory, 'corrupt_ema')
+            os.mkdir(corrupt_dir)
+            corrupt_trainer = make_trainer(corrupt_dir, ckpt, mesh, corrupt_path)
+            corrupt_trainer.opt.refine_multiround_horizon = 6
+            with self.assertRaisesRegex(ValueError, 'vertex EMA or mapping'):
+                refinement_multiround.run_multiround(corrupt_trainer, Dataset(), Dataset(), [0], [1])
             old_pending = copy.deepcopy(pending)
             old_pending['config'].pop('policy_objective')
             old_pending_path = os.path.join(directory, 'old_open.pt')

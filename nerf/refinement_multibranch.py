@@ -12,6 +12,7 @@ from scipy.ndimage import binary_erosion, distance_transform_edt
 from nerf.refinement_experiment import _select_views, _train_branch
 from nerf.refinement_multiround import _observe_silhouette
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256
+from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION, candidate_features, remap_vertex_ema, visibility_counts
 
 
 def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
@@ -21,8 +22,16 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
         raise ValueError('Policy trajectory does not match the Stage 1 checkpoint and mesh hashes')
     if 'policy' not in trajectory:
         raise ValueError('Trajectory checkpoint does not contain policy weights')
-    policy = FacePolicy()
-    policy.load_state_dict(trajectory['policy'])
+    policy = CandidatePolicy() if config.get('feature_version') == FEATURE_VERSION else FacePolicy()
+    if isinstance(policy, CandidatePolicy):
+        options = config.get('options', {})
+        policy.candidate_settings = {'fraction': options.get('refine_candidate_fraction', 0.5),
+                                     'min_area': options.get('refine_min_face_area', 1e-12),
+                                     'ema_beta': options.get('refine_gradient_ema_beta', 0.9)}
+    try:
+        policy.load_state_dict(trajectory['policy'])
+    except RuntimeError as error:
+        raise ValueError('Policy checkpoint has incompatible feature dimensions') from error
     policy.eval()
     for parameter in policy.parameters():
         parameter.requires_grad_(False)
@@ -162,12 +171,19 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     result['face_observations'] = ('NPZ arrays indexed by pre-update face ID; contour distance is the minimum '
                                    'pixel distance to a ground-truth alpha > 0.5 boundary over selection views')
     result['contour_radius_pixels'] = contour_radius
+    result['rl_policy_feature_version'] = FEATURE_VERSION if isinstance(policy, CandidatePolicy) else 'legacy_three_features'
+    result['rl_vertex_ema_initialization'] = 'zeros on starting Stage 1 mesh; updated after each valid optimization step'
+    if isinstance(policy, CandidatePolicy):
+        result['rl_selection'] = 'area-filtered candidates, sigmoid probability >= 0.5, descending score, then budget'
+        result['rl_candidate_settings'] = policy.candidate_settings
 
     branches = [('rl', None), ('high_error', None)] + [('random', seed) for seed in seeds]
     _save_json(os.path.join(opt.refine_experiment_output, 'multibranch_metadata.json'), result)
     opt.refine = False
     for method, random_seed in branches:
         restore()
+        vertex_state = {'ema': np.zeros(len(model.vertices), dtype=np.float64),
+                        'seen': np.zeros(len(model.vertices), dtype=bool)}
         branch = {'method': method, 'random_seed': random_seed,
                   'initial_faces': len(model.triangles), 'initial_global_step': trainer.global_step,
                   'initial_metrics': initial_metrics, 'rounds': []}
@@ -184,18 +200,38 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             model.triangles_errors = torch.tensor(sums, dtype=torch.float32, device=trainer.device)
             model.triangles_errors_cnt = torch.tensor(counts, dtype=torch.float32, device=trainer.device)
             visible = np.flatnonzero(counts > 0)
-            if method == 'rl' and len(visible):
-                visible, features, _ = face_features(vertices, model.triangles.cpu().numpy(), sums, counts)
-                with torch.no_grad():
-                    scores = policy(torch.from_numpy(features)).numpy()
-                order = visible[np.argsort(-scores, kind='stable')]
+            candidate_info = None
+            candidate_mask = np.zeros(face_count, dtype=bool)
+            candidate_feature_values = np.full((face_count, 9), np.nan, dtype=np.float32)
+            request_probability = np.full(face_count, np.nan, dtype=np.float32)
+            round_budget = min(opt.refine_face_budget, total_budget - cumulative)
+            if method == 'rl' and (len(visible) or isinstance(policy, CandidatePolicy)):
+                if isinstance(policy, CandidatePolicy):
+                    _, _, view_counts = visibility_counts(observations, face_count)
+                    visible, features, candidate_info = candidate_features(
+                        vertices, faces, sums, counts, view_counts, len(selection_views),
+                        vertex_state['ema'], vertex_state['seen'], round_budget / opt.refine_face_budget,
+                        policy.candidate_settings['fraction'], policy.candidate_settings['min_area'])
+                    candidate_mask[visible] = True
+                    with torch.no_grad():
+                        logits = policy(torch.from_numpy(features))
+                        scores = logits.numpy()
+                        request_probability[visible] = torch.sigmoid(logits).numpy()
+                    candidate_feature_values[visible] = features
+                    requested = np.flatnonzero(scores >= 0)
+                    order = visible[requested[np.argsort(-scores[requested], kind='stable')]]
+                else:
+                    visible, features, _ = face_features(vertices, faces, sums, counts)
+                    candidate_mask[visible] = True
+                    with torch.no_grad():
+                        scores = policy(torch.from_numpy(features)).numpy()
+                    order = visible[np.argsort(-scores, kind='stable')]
             elif method == 'high_error':
                 order = visible[np.argsort(-(sums[visible] / counts[visible]), kind='stable')]
             elif method == 'random':
                 order = random_generator.permutation(visible)
             else:
                 order = visible
-            round_budget = min(opt.refine_face_budget, total_budget - cumulative)
             model.refine_and_decimate(export_mesh=False, candidate_order=order, max_added_faces=round_budget)
             event = copy.deepcopy(model.refinement_event)
             actual = len(model.triangles) - face_count
@@ -204,8 +240,14 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             cumulative += actual
             event['global_step'] = trainer.global_step
             event['parent_face_id'] = model.parent_face_id.cpu().numpy().tolist()
+            if method == 'rl' and isinstance(policy, CandidatePolicy):
+                vertex_state['ema'], vertex_state['seen'], vertex_mapping = remap_vertex_ema(
+                    vertex_state['ema'], vertex_state['seen'], event, len(model.vertices))
+                event['vertex_mapping'] = vertex_mapping.tolist()
             status = np.full(face_count, 'not_visible', dtype='<U24')
-            status[visible] = 'budget_not_considered'
+            status[counts > 0] = 'not_candidate' if method == 'rl' and isinstance(policy, CandidatePolicy) else 'budget_not_considered'
+            status[visible] = 'hold' if method == 'rl' and isinstance(policy, CandidatePolicy) else 'budget_not_considered'
+            status[order] = 'budget_not_considered'
             for face in order[:event['considered_count']]:
                 status[face] = event['request_status'][int(face)]
             passive = np.zeros(face_count, dtype=bool)
@@ -217,14 +259,28 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                 face_id=np.arange(face_count), rgb_mean=means, visible_pixels=counts,
                                 area=areas, contour_near_pixels=near_counts,
                                 min_contour_distance_pixels=min_distance, status=status,
-                                passive=passive, executed_requester=executed)
-            _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index])
+                                passive=passive, executed_requester=executed, candidate=candidate_mask,
+                                candidate_features=candidate_feature_values,
+                                request_probability=request_probability)
+            _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
+                          vertex_state if method == 'rl' and isinstance(policy, CandidatePolicy) else None,
+                          policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
             metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
                                          evaluation_views, shapes)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
                                      'faces_after': len(model.triangles), 'visible_candidates': len(visible),
+                                     'requested_count': len(order), 'hold_count': len(visible) - len(order),
+                                     'executed_request_count': sum(
+                                         event['request_status'][int(face)] == 'executed'
+                                         for face in order[:event['considered_count']]),
+                                     'conflict_count': sum(
+                                         event['request_status'][int(face)] == 'conflict'
+                                         for face in order[:event['considered_count']]),
+                                     'budget_unexecuted_count': sum(
+                                         event['request_status'][int(face)] == 'budget' for face in order),
                                      'round_budget': round_budget, 'actual_added_faces': actual,
                                      'face_observations': observations_file, 'contour_views': contour_views,
+                                     'candidate_info': candidate_info,
                                      'cumulative_added_faces': cumulative, 'unfilled_budget': round_budget - actual,
                                      'training_indices': training_indices[round_index],
                                      'training_seed': training_seeds[round_index], 'event': event,

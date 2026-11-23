@@ -12,6 +12,7 @@ from meshutils import subdivide_longest_edges
 from nerf.refinement_multibranch import (full_frame_metrics, load_trajectory_policy, run_multibranch,
                                          selection_face_observations)
 from nerf.refinement_rl import FacePolicy, file_sha256
+from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION
 
 
 class MultiBranchTest(unittest.TestCase):
@@ -147,6 +148,37 @@ class MultiBranchTest(unittest.TestCase):
                         self.assertEqual(len(faces['area']), step['faces_before'])
                         self.assertEqual(len(faces['visible_pixels']), step['faces_before'])
                         self.assertEqual(int(faces['executed_requester'].sum()), len(step['event']['edge_events']))
+
+            candidate_policy = CandidatePolicy()
+            with torch.no_grad():
+                candidate_policy.network[-1].bias.fill_(10.)
+            torch.save({'policy': candidate_policy.state_dict(),
+                        'config': {'checkpoint_sha256': file_sha256(checkpoint),
+                                   'mesh_sha256': file_sha256(mesh), 'feature_version': FEATURE_VERSION}}, policy_path)
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 10
+            opt.refine = True
+            opt.refine_candidate_fraction = .5
+            opt.refine_min_face_area = 1e-12
+            opt.refine_gradient_ema_beta = .9
+            opt.refine_experiment_output = os.path.join(directory, 'candidates')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                candidate_result = json.load(source)
+            rl = candidate_result['branches'][0]
+            self.assertEqual(rl['rounds'][0]['candidate_info']['valid_faces'], 2)
+            self.assertEqual(rl['rounds'][0]['candidate_info']['candidate_faces'], 1)
+            self.assertEqual(rl['rounds'][0]['candidate_info']['gradient_missing'], 1)
+            self.assertGreater(rl['rounds'][0]['actual_added_faces'], 0)
+            with np.load(os.path.join(opt.refine_experiment_output, rl['rounds'][0]['face_observations'])) as saved:
+                candidate_ids = np.flatnonzero(saved['candidate'])
+                self.assertEqual(len(candidate_ids), 1)
+                self.assertEqual(saved['candidate_features'][candidate_ids[0], 7], 1.)
+                self.assertGreater(saved['request_probability'][candidate_ids[0]], .5)
 
 
 if __name__ == '__main__':

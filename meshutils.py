@@ -254,6 +254,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
         request_status[int(face_id)] = 'executed'
         executed_edges.append(list(edge))
         edge_events.append({'edge': list(edge), 'requester_face': int(face_id),
+                            'midpoint_vertex': len(new_vertices),
                             'affected_faces': list(map(int, incident_faces)),
                             'added_faces': len(incident_faces)})
         added_faces += len(incident_faces)

@@ -150,7 +150,9 @@ def training_rounds(checkpoint):
         visible = array(transition['visible'], np.int64)
         features = array(transition['features'], np.float64)
         scales = array(transition['feature_scales'], np.float64)
-        if features.shape != (len(visible), 3) or scales.shape != (3,):
+        candidate_features = 'candidate_info' in transition
+        expected_shape = (len(visible), 9 if candidate_features else 3)
+        if features.shape != expected_shape or scales.shape != ((5,) if candidate_features else (3,)):
             raise ValueError('Unexpected training feature dimensions')
         positions = np.full(total_faces, -1, dtype=np.int64)
         positions[visible] = np.arange(len(visible))
@@ -168,7 +170,14 @@ def training_rounds(checkpoint):
                 raise ValueError('Execution face index outside training topology')
             rows = positions[ids]
             rows = rows[rows >= 0]
-            decoded = np.expm1(features[rows]) * scales
+            if candidate_features:
+                decoded = np.column_stack((np.expm1(features[rows, 1]) * scales[1],
+                                           np.expm1(features[rows, 5]) * scales[4],
+                                           np.expm1(features[rows, 0]) * scales[0]))
+                clipped = features[rows][:, [1, 5, 0]] >= 5 - 1e-6
+            else:
+                decoded = np.expm1(features[rows]) * scales
+                clipped = features[rows] >= 5 - 1e-6
             extra = np.maximum(sil_count[ids] - counts[ids], 0)
             return {'face_count': len(ids), 'visible_in_selection': len(rows),
                     'silhouette_improvement': distribution(sil_delta[ids]),
@@ -182,7 +191,7 @@ def training_rounds(checkpoint):
                     'selection_rgb_mean_approx': distribution(decoded[:, 0]),
                     'selection_pixels_approx': distribution(decoded[:, 1]),
                     'face_area_approx': distribution(decoded[:, 2]),
-                    'feature_clipped_counts': (features[rows] >= 5 - 1e-6).sum(axis=0).tolist(),
+                    'feature_clipped_counts': clipped.sum(axis=0).tolist(),
                     'faces_with_uncovered_target_pixels_assigned': int(np.count_nonzero(extra)),
                     'assigned_uncovered_target_pixels': int(extra.sum())}
 
@@ -210,7 +219,9 @@ def training_rounds(checkpoint):
             else:
                 report['descendant_check'] = 'unavailable: missing or incompatible parent mapping'
         # This is an objective-term proxy, not a parameter-gradient norm.
-        if 'selection_order' in transition and 'considered_count' in transition:
+        if candidate_features:
+            report['objective_term_proxy'] = 'unavailable: Bernoulli candidate policy uses different action probabilities'
+        elif 'selection_order' in transition and 'considered_count' in transition:
             order = array(transition['selection_order'], np.int64)
             probabilities = array(transition['probabilities'], np.float64)[order]
             denominator = np.cumsum(probabilities[::-1])[::-1]

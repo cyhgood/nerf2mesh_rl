@@ -10,10 +10,12 @@ from torch import nn
 from scipy.ndimage import distance_transform_edt
 
 from nerf.refinement_experiment import _fixed_region_means, _observe, _select_views, _train_branch
-from nerf.refinement_rl import FacePolicy, face_features, file_sha256, policy_order
+from nerf.refinement_rl import file_sha256
+from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candidate_features,
+                                        remap_vertex_ema, visibility_counts)
 
 
-POLICY_OBJECTIVE = 'face_advantage_valid_children_v2'
+POLICY_OBJECTIVE = 'candidate_bernoulli_ema_v3'
 
 
 def edge_costs(event, face_count):
@@ -61,26 +63,24 @@ def lineage_returns(transitions, gamma, return_missing=False):
 
 def face_policy_losses(policy, transitions, returns, baseline='none', scale='none', clip=0.0,
                        return_stats=False):
-    """Weight each considered ranking decision by that face's lineage return."""
+    """Weight sampled request/hold log-probabilities by per-face lineage return."""
     losses = []
     stats = []
     for transition, face_returns in zip(transitions, returns):
-        order = torch.as_tensor(transition['selection_order'], dtype=torch.long)
-        count = transition['considered_count']
-        if not count:
+        visible = transition['visible']
+        if not len(visible):
             losses.append(None)
             stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
             continue
-        ordered_faces = transition['visible'][order[:count].numpy()]
-        values = face_returns[ordered_faces]
+        values = face_returns[visible]
         valid = np.isfinite(values)
         if not valid.any():
             losses.append(None)
             stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
             continue
-        logits = policy(torch.from_numpy(transition['features']))[order]
-        denominators = torch.logcumsumexp(logits.flip(0), dim=0).flip(0)
-        log_probabilities = (logits - denominators)[:count]
+        logits = policy(torch.from_numpy(transition['features']))
+        sampled = torch.from_numpy(transition['actions'].astype(np.float32))
+        log_probabilities = -torch.nn.functional.binary_cross_entropy_with_logits(logits, sampled, reduction='none')
         mask = torch.from_numpy(valid)
         raw = values[valid]
         baseline_value = float(raw.mean()) if baseline == 'mean' else 0.0
@@ -144,7 +144,9 @@ def action_counts(transition):
     event = transition['event']
     statuses = list(event['request_status'].values())
     considered = event['considered_count']
-    return {'requested_count': considered, 'hold_count': len(transition['visible']) - considered,
+    return {'requested_count': int(np.count_nonzero(transition['actions'])),
+            'hold_count': int(len(transition['visible']) - np.count_nonzero(transition['actions'])),
+            'considered_count': considered,
             'executed_request_count': statuses.count('executed'),
             'executed_edge_count': len(event['executed_edges']),
             'conflict_count': statuses.count('conflict'),
@@ -222,6 +224,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     advantage_baseline = getattr(opt, 'refine_advantage_baseline', 'mean')
     advantage_scale = getattr(opt, 'refine_advantage_scale', 'std')
     advantage_clip = getattr(opt, 'refine_advantage_clip', 5.0)
+    candidate_fraction = getattr(opt, 'refine_candidate_fraction', 0.5)
+    min_area = getattr(opt, 'refine_min_face_area', 1e-12)
+    ema_beta = getattr(opt, 'refine_gradient_ema_beta', 0.9)
     if (not opt.refine_rl or opt.refine_compare_random or opt.refine_rl_eval or
             opt.refine_face_budget < 1 or opt.refine_multiround_rounds < 1 or horizon < 1 or opt.refine_rl_lr <= 0 or
             not 0 <= opt.refine_multiround_gamma <= 1):
@@ -234,6 +239,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     if (advantage_baseline not in ('none', 'mean') or advantage_scale not in ('none', 'std')
             or not np.isfinite(advantage_clip) or advantage_clip < 0):
         raise ValueError('Invalid advantage baseline, scale, or clip')
+    if not 0 < candidate_fraction <= 1 or not 0 <= ema_beta < 1 or not np.isfinite(min_area) or min_area < 0:
+        raise ValueError('Invalid candidate fraction, EMA decay or minimum area')
     reward_views = opt.refine_rl_reward_views or selection_views
     _select_views(len(val_data.poses), 1, selection_views, evaluation_views)
     if (not reward_views or len(reward_views) != len(set(reward_views)) or
@@ -252,6 +259,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'lineage_weights': 'child area after optimization normalized over each parent',
               'cost_allocation': 'all faces added by an edge charged once to its first executing requester',
               'policy_objective': POLICY_OBJECTIVE,
+              'feature_version': FEATURE_VERSION,
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
               'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
@@ -259,12 +267,16 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     config['options'] = {key: value for key, value in vars(opt).items() if key not in excluded_options}
     model = trainer.model
     torch.manual_seed(opt.seed)
-    policy = FacePolicy()
+    policy = CandidatePolicy()
     optimizer = torch.optim.Adam(policy.parameters(), lr=opt.refine_rl_lr)
     generator = torch.Generator().manual_seed(opt.seed)
     transitions = []
     history = []
     completed = False
+    vertex_state = {'ema': np.zeros(len(model.vertices), dtype=np.float64),
+                    'seen': np.zeros(len(model.vertices), dtype=bool)}
+    vertex_mapping = np.repeat(np.arange(len(model.vertices))[:, None], 2, axis=1)
+    ema_initialization = 'zero_initial_mesh'
     if opt.refine_multiround_resume:
         saved = torch.load(opt.refine_multiround_resume, map_location='cpu')
         old_config = dict(saved['config'])
@@ -275,11 +287,15 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         old_radius = old_config.pop('silhouette_radius', None)
         old_objective = old_config.pop('policy_objective', None)
         requested_config.pop('policy_objective')
+        old_feature_version = old_config.pop('feature_version', None)
+        requested_config.pop('feature_version')
         requested_config.pop('horizon')
         requested_config.pop('silhouette_radius')
         if not saved['completed'] and old_objective != POLICY_OBJECTIVE:
             raise ValueError('Cannot resume an open segment from a different policy objective; '
                              'resume a completed checkpoint or start from Stage 1')
+        if old_feature_version != FEATURE_VERSION and not getattr(opt, 'refine_reinitialize_legacy_policy', False):
+            raise ValueError('Legacy policy has incompatible input dimensions; start from Stage 1 or explicitly use --refine_reinitialize_legacy_policy on a completed trajectory')
         if saved['completed']:
             old_config.pop('pixel_regions', None)
             requested_config.pop('pixel_regions', None)
@@ -293,6 +309,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             for key in ('refine_multibranch_eval', 'refine_multibranch_policy',
                         'refine_multibranch_rounds', 'refine_multibranch_total_budget',
                         'refine_advantage_baseline', 'refine_advantage_scale', 'refine_advantage_clip'):
+                if key not in old_options:
+                    new_options.pop(key, None)
+            for key in ('refine_candidate_fraction', 'refine_min_face_area',
+                        'refine_gradient_ema_beta', 'refine_reinitialize_legacy_policy'):
                 if key not in old_options:
                     new_options.pop(key, None)
             old_config['options'], requested_config['options'] = old_options, new_options
@@ -314,11 +334,26 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         trainer.lr_scheduler.load_state_dict(saved['mesh_scheduler'])
         trainer.scaler.load_state_dict(saved['scaler'])
         trainer.global_step = saved['global_step']
-        policy.load_state_dict(saved['policy'])
-        if old_objective == POLICY_OBJECTIVE:
+        if old_feature_version == FEATURE_VERSION:
+            policy.load_state_dict(saved['policy'])
+        if old_objective == POLICY_OBJECTIVE and old_feature_version == FEATURE_VERSION:
             optimizer.load_state_dict(saved['policy_optimizer'])
+            if any(key not in saved for key in ('vertex_gradient_ema', 'vertex_gradient_seen', 'vertex_mapping')):
+                raise ValueError('Candidate-policy checkpoint is missing vertex EMA or mapping')
+            vertex_state = {'ema': np.asarray(saved['vertex_gradient_ema'], dtype=np.float64),
+                            'seen': np.asarray(saved['vertex_gradient_seen'], dtype=bool)}
+            vertex_mapping = np.asarray(saved['vertex_mapping'], dtype=np.int64)
+            if (len(vertex_state['ema']) != len(model.vertices) or len(vertex_state['seen']) != len(model.vertices)
+                    or vertex_mapping.shape != (len(model.vertices), 2)
+                    or not np.isfinite(vertex_state['ema']).all()):
+                raise ValueError('Saved vertex EMA or mapping does not match the current mesh')
+            ema_initialization = saved.get('ema_initialization', 'restored')
         else:
-            trainer.log('[INFO] policy objective changed; loaded weights with a fresh policy optimizer')
+            vertex_state = {'ema': np.zeros(len(model.vertices), dtype=np.float64),
+                            'seen': np.zeros(len(model.vertices), dtype=bool)}
+            vertex_mapping = np.repeat(np.arange(len(model.vertices))[:, None], 2, axis=1)
+            ema_initialization = 'legacy_mesh_zero_ema_and_reinitialized_policy'
+            trainer.log('[INFO] incompatible legacy policy: initialized new policy and zero vertex EMA')
         generator.set_state(saved['generator_state'])
         history = saved.get('history', [])
         transitions = saved['transitions']
@@ -334,6 +369,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                  'f_cumsum': model.f_cumsum, 'mesh_optimizer': trainer.optimizer.state_dict(),
                  'mesh_scheduler': trainer.lr_scheduler.state_dict(), 'scaler': trainer.scaler.state_dict(),
                  'policy': policy.state_dict(), 'policy_optimizer': optimizer.state_dict(),
+                 'vertex_gradient_ema': vertex_state['ema'], 'vertex_gradient_seen': vertex_state['seen'],
+                 'vertex_mapping': vertex_mapping, 'ema_initialization': ema_initialization,
                  'generator_state': generator.get_state(), 'history': history, 'transitions': transitions}
         _save(os.path.join(opt.refine_experiment_output, 'trajectory.pt'), state)
 
@@ -344,37 +381,37 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         selection = _observe(trainer, val_data, selection_views)
         before = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
         evaluation_before = _observe_silhouette(trainer, val_data, evaluation_views)
-        sums = np.zeros(count, dtype=np.float64)
-        observations = np.zeros(count, dtype=np.float64)
-        for faces, losses, _ in selection:
-            mask = faces >= 0
-            sums += np.bincount(faces[mask], weights=losses[mask], minlength=count)
-            observations += np.bincount(faces[mask], minlength=count)
+        sums, observations, view_counts = visibility_counts(selection, count)
         model.triangles_errors = torch.tensor(sums, dtype=torch.float32, device=trainer.device)
         model.triangles_errors_cnt = torch.tensor(observations, dtype=torch.float32, device=trainer.device)
         current_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
-        visible, features, scales = face_features(current_vertices, model.triangles.cpu().numpy(), sums, observations)
+        visible, features, feature_info = candidate_features(
+            current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
+            len(selection_views), vertex_state['ema'], vertex_state['seen'], 1.0,
+            candidate_fraction, min_area)
         feature_tensor = torch.from_numpy(features)
         with torch.no_grad():
             logits = policy(feature_tensor)
-            probabilities = torch.softmax(logits, dim=0)
-            order = policy_order(logits, generator, 'sample')
-            requested = visible[order.numpy()]
+            probabilities = torch.sigmoid(logits)
+            actions = (torch.rand(len(visible), generator=generator) < probabilities).numpy()
+            requested_positions = np.flatnonzero(actions)
+            requested_positions = requested_positions[np.argsort(-logits.numpy()[requested_positions], kind='stable')]
+            requested = visible[requested_positions]
         model.refine_and_decimate(export_mesh=False, candidate_order=requested, max_added_faces=opt.refine_face_budget)
         event = copy.deepcopy(model.refinement_event)
         considered_count = event['considered_count']
-        actions = np.zeros(len(visible), dtype=bool)
-        actions[order[:considered_count].numpy()] = True
         for face in requested[considered_count:]:
             event['request_status'][int(face)] = 'budget_not_considered'
         parents = model.parent_face_id.cpu().numpy().copy()
         if len(model.triangles) - count != event['added_faces']:
             raise RuntimeError('Mesh change does not match recorded face budget')
+        vertex_state['ema'], vertex_state['seen'], vertex_mapping = remap_vertex_ema(
+            vertex_state['ema'], vertex_state['seen'], event, len(model.vertices))
         costs = edge_costs(event, count)
         global_round = len(history) + t
         step_seed = (opt.seed + global_round) % (2 ** 32)
         indices = np.random.RandomState(step_seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
-        _train_branch(trainer, train_data, indices, step_seed)
+        _train_branch(trainer, train_data, indices, step_seed, vertex_state, ema_beta)
         after = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
         evaluation_after = _observe_silhouette(trainer, val_data, evaluation_views)
         pixel_counts, rgb_before, rgb_after = _region_stats(before, after, count, 1)
@@ -397,9 +434,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                           'sil_after': float(np.average(eval_sil_after[valid_eval_sil], weights=eval_sil_counts[valid_eval_sil])) if valid_eval_sil.any() else None}
         transitions.append({'round': global_round + 1, 'faces_before': count, 'faces_after': len(model.triangles),
                             'global_step': trainer.global_step, 'training_indices': indices, 'event': event,
-                            'visible': visible, 'features': features, 'feature_scales': scales,
+                            'visible': visible, 'features': features, 'feature_scales': np.asarray(feature_info['normalization_scales']),
+                            'candidate_info': feature_info, 'vertex_mapping': vertex_mapping,
                             'actions': actions, 'probabilities': probabilities.numpy(),
-                            'selection_order': order.numpy(), 'considered_count': considered_count,
+                            'selection_order': requested_positions, 'considered_count': considered_count,
                             'parent_face_id': parents, 'child_areas': child_areas, 'costs': costs,
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
                             'sil_before': sil_before, 'sil_after': sil_after, 'reward': rewards,
@@ -416,6 +454,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'global_step': transition['global_step'], 'training_indices': transition['training_indices'],
                       'visible_face_ids': transition['visible'].tolist(), 'actions': transition['actions'].tolist(),
                       'probabilities': transition['probabilities'].tolist(),
+                      'candidate_info': transition['candidate_info'],
+                      'candidate_features': transition['features'].tolist(),
+                      'vertex_mapping': transition['vertex_mapping'].tolist(),
                       'action_status': [event['request_status'].get(int(face), 'hold') for face in transition['visible']],
                       'passively_split': [int(face) in passive_faces for face in transition['visible']],
                       'event': event, 'parent_face_id': transition['parent_face_id'].tolist(),
@@ -432,7 +473,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}_pending.json'.format(transition['round'])), 'w') as output:
                 json.dump(record, output, indent=2, allow_nan=False)
         with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
-            json.dump(dict(config, segment_status='open', segment_rounds=len(transitions)), output, indent=2)
+            json.dump(dict(config, segment_status='open', segment_rounds=len(transitions),
+                           ema_initialization=ema_initialization), output, indent=2)
         trainer.log('[INFO] open return segment: {}/{} rounds; resume trajectory.pt'.format(len(transitions), horizon))
         return
 
@@ -475,6 +517,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                                     for face in transition['visible']],
                   'passively_split': [int(face) in passive_faces for face in transition['visible']],
                   'probabilities': transition['probabilities'].tolist(),
+                  'candidate_info': transition['candidate_info'],
+                  'candidate_features': transition['features'].tolist(),
+                  'vertex_mapping': transition['vertex_mapping'].tolist(),
                   'feature_scales': transition['feature_scales'].tolist(), 'face_costs': transition['costs'].tolist(),
                   'reward_pixels': transition['reward_pixels'].tolist(),
                   'silhouette_pixels': transition['silhouette_pixels'].tolist(),
@@ -486,6 +531,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             json.dump(record, output, indent=2, allow_nan=False)
     snapshot(True)
     with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
-        json.dump(dict(config, segment_status='complete', segment_start_round=transitions[0]['round'],
+        json.dump(dict(config, segment_status='complete', ema_initialization=ema_initialization,
+                       segment_start_round=transitions[0]['round'],
                        segment_terminal_round=transitions[-1]['round']), output, indent=2, allow_nan=False)
     trainer.log('[INFO] multi-round trajectory saved to ' + opt.refine_experiment_output)

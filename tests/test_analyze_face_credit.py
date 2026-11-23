@@ -73,6 +73,14 @@ class AnalyzeFaceCreditTest(unittest.TestCase):
         self.assertAlmostEqual(first['executed_requesters']['weighted_face_cost']['mean'], -.2)
         self.assertEqual(first['valid_local_but_invalid_return_count'], 1)
         self.assertEqual(first['parents_with_valid_local_and_invalid_next_descendant_including_possible_segment_boundaries'], 1)
+        transition['candidate_info'] = {'candidate_faces': 2}
+        transition['features'] = np.full((2, 9), np.log(2))
+        transition['feature_scales'] = np.array([.2, .5, 3., 4., 10.])
+        new_report = analysis.training_rounds({'config': {'weights': [2., 3., .1]},
+                                              'transitions': [transition]})['rounds'][0]
+        self.assertAlmostEqual(new_report['executed_requesters']['selection_rgb_mean_approx']['mean'], .5)
+        self.assertAlmostEqual(new_report['executed_requesters']['selection_pixels_approx']['mean'], 10.)
+        self.assertIn('Bernoulli', new_report['objective_term_proxy'])
 
 
 if __name__ == '__main__':

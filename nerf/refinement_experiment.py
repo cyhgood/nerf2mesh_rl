@@ -92,7 +92,7 @@ def _foreground_errors(before, refined, control, view_ids):
                   'refined_error': means[1], 'control_error': means[2]}
 
 
-def _train_branch(trainer, dataset, indices, seed):
+def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0.9):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -106,8 +106,24 @@ def _train_branch(trainer, dataset, indices, seed):
         _, _, loss = trainer.train_step(dataset.collate([int(index)]))
         trainer.scaler.scale(loss).backward()
         trainer.post_train_step()
+        norms = None
+        step_finite = True
+        old_scale = trainer.scaler.get_scale()
+        if vertex_state is not None:
+            trainer.scaler.unscale_(trainer.optimizer)
+            gradient = trainer.model.vertices_offsets.grad
+            if gradient is not None:
+                norms = gradient.detach().norm(dim=-1).cpu().numpy().copy()
+            if not trainer.scaler.is_enabled():
+                step_finite = all(torch.isfinite(parameter.grad).all().item()
+                                  for group in trainer.optimizer.param_groups for parameter in group['params']
+                                  if parameter.grad is not None)
         trainer.scaler.step(trainer.optimizer)
         trainer.scaler.update()
+        if vertex_state is not None:
+            from nerf.refinement_candidates import update_vertex_ema
+            update_vertex_ema(vertex_state, norms, ema_beta,
+                              step_finite and trainer.scaler.get_scale() >= old_scale)
         trainer.lr_scheduler.step()
 
 
