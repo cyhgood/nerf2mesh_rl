@@ -10,7 +10,10 @@ from torch import nn
 from scipy.ndimage import distance_transform_edt
 
 from nerf.refinement_experiment import _fixed_region_means, _observe, _select_views, _train_branch
-from nerf.refinement_rl import FacePolicy, face_features, file_sha256
+from nerf.refinement_rl import FacePolicy, face_features, file_sha256, policy_order
+
+
+POLICY_OBJECTIVE = 'face_return_plackett_luce_v1'
 
 
 def edge_costs(event, face_count):
@@ -53,19 +56,61 @@ def lineage_returns(transitions, gamma):
     return result
 
 
-def joint_policy_loss(policy, transitions, returns):
-    """Score the complete sampled joint action against the segment-start objective."""
-    valid = np.isfinite(returns[0])
-    if not valid.any():
-        return None, []
-    objective = float(np.mean(returns[0][valid]))
+def face_policy_losses(policy, transitions, returns):
+    """Weight each considered ranking decision by that face's lineage return."""
     losses = []
-    for transition in transitions:
-        logits = policy(torch.from_numpy(transition['features']))
-        actions = torch.from_numpy(transition['actions'].astype(np.float32))
-        log_probs = -torch.nn.functional.binary_cross_entropy_with_logits(logits, actions, reduction='none')
-        losses.append(-log_probs.sum() * objective)
-    return objective, losses
+    for transition, face_returns in zip(transitions, returns):
+        order = torch.as_tensor(transition['selection_order'], dtype=torch.long)
+        count = transition['considered_count']
+        if not count:
+            losses.append(None)
+            continue
+        ordered_faces = transition['visible'][order[:count].numpy()]
+        values = face_returns[ordered_faces]
+        valid = np.isfinite(values)
+        if not valid.any():
+            losses.append(None)
+            continue
+        logits = policy(torch.from_numpy(transition['features']))[order]
+        denominators = torch.logcumsumexp(logits.flip(0), dim=0).flip(0)
+        log_probabilities = (logits - denominators)[:count]
+        mask = torch.from_numpy(valid)
+        weighted_returns = torch.as_tensor(values[valid], dtype=logits.dtype)
+        losses.append(-(log_probabilities[mask] * weighted_returns).sum())
+    return losses
+
+
+def _distribution(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return {'count': 0, 'sum': None, 'mean': None, 'min': None, 'p25': None,
+                'median': None, 'p75': None, 'max': None}
+    quantiles = np.quantile(values, [0, .25, .5, .75, 1])
+    return {'count': len(values), 'sum': float(values.sum()), 'mean': float(values.mean()),
+            **dict(zip(('min', 'p25', 'median', 'p75', 'max'), map(float, quantiles)))}
+
+
+def reward_distributions(transition, weights, returns=None):
+    valid = transition['reward_pixels'] > 0
+    silhouette = np.where(valid, weights[0] * (transition['sil_before'] - transition['sil_after']), np.nan)
+    rgb = np.where(valid, weights[1] * (transition['rgb_before'] - transition['rgb_after']), np.nan)
+    cost = np.where(valid, -weights[2] * transition['costs'], np.nan)
+    return {'silhouette': _distribution(silhouette), 'rgb': _distribution(rgb),
+            'face_cost': _distribution(cost), 'local_reward': _distribution(transition['reward']),
+            'lineage_return': _distribution([] if returns is None else returns)}
+
+
+def action_counts(transition):
+    event = transition['event']
+    statuses = list(event['request_status'].values())
+    considered = event['considered_count']
+    return {'requested_count': considered, 'hold_count': len(transition['visible']) - considered,
+            'executed_request_count': statuses.count('executed'),
+            'executed_edge_count': len(event['executed_edges']),
+            'conflict_count': statuses.count('conflict'),
+            'budget_rejected_count': statuses.count('budget'),
+            'budget_not_considered_count': statuses.count('budget_not_considered')}
 
 
 def _observe_silhouette(trainer, dataset, views, training_dataset=False):
@@ -160,7 +205,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'silhouette_error': 'absolute antialiased raster alpha minus ground-truth alpha',
               'pixel_regions': 'pre-update face index; uncovered target pixels assigned to nearest face within radius for silhouette',
               'lineage_weights': 'child area after optimization normalized over each parent',
-              'cost_allocation': 'all faces added by an edge charged once to its first executing requester'}
+              'cost_allocation': 'all faces added by an edge charged once to its first executing requester',
+              'policy_objective': POLICY_OBJECTIVE}
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
                         'refine_multiround_horizon', 'refine_silhouette_radius'}
     config['options'] = {key: value for key, value in vars(opt).items() if key not in excluded_options}
@@ -180,13 +226,27 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         requested_config.pop('rounds')
         old_horizon = old_config.pop('horizon', None)
         old_radius = old_config.pop('silhouette_radius', None)
+        old_objective = old_config.pop('policy_objective', None)
+        requested_config.pop('policy_objective')
         requested_config.pop('horizon')
         requested_config.pop('silhouette_radius')
+        if not saved['completed'] and old_objective != POLICY_OBJECTIVE:
+            raise ValueError('Cannot resume an open segment from a different policy objective; '
+                             'resume a completed checkpoint or start from Stage 1')
         if saved['completed']:
             old_config.pop('pixel_regions', None)
             requested_config.pop('pixel_regions', None)
+        if saved['completed'] and old_objective != POLICY_OBJECTIVE:
+            old_options = dict(old_config.get('options', {}))
+            new_options = dict(requested_config.get('options', {}))
+            for key in ('refine_multibranch_eval', 'refine_multibranch_policy',
+                        'refine_multibranch_rounds', 'refine_multibranch_total_budget'):
+                if key not in old_options:
+                    new_options.pop(key, None)
+            old_config['options'], requested_config['options'] = old_options, new_options
         if (old_config != requested_config or
-                (not saved['completed'] and (old_horizon != horizon or old_radius != radius))):
+                (not saved['completed'] and (old_horizon != horizon or old_radius != radius or
+                                              old_objective != POLICY_OBJECTIVE))):
             raise ValueError('Resume checkpoint configuration or input file hashes differ')
         model.vertices = saved['vertices'].to(trainer.device)
         model.triangles = saved['triangles'].to(trainer.device)
@@ -203,7 +263,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         trainer.scaler.load_state_dict(saved['scaler'])
         trainer.global_step = saved['global_step']
         policy.load_state_dict(saved['policy'])
-        optimizer.load_state_dict(saved['policy_optimizer'])
+        if old_objective == POLICY_OBJECTIVE:
+            optimizer.load_state_dict(saved['policy_optimizer'])
+        else:
+            trainer.log('[INFO] policy objective changed; loaded weights with a fresh policy optimizer')
         generator.set_state(saved['generator_state'])
         history = saved.get('history', [])
         transitions = saved['transitions']
@@ -241,12 +304,17 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         visible, features, scales = face_features(current_vertices, model.triangles.cpu().numpy(), sums, observations)
         feature_tensor = torch.from_numpy(features)
         with torch.no_grad():
-            probabilities = torch.sigmoid(policy(feature_tensor))
-            actions = torch.rand(len(visible), generator=generator) < probabilities
-            requested = visible[actions.numpy()]
-            requested = requested[torch.randperm(len(requested), generator=generator).numpy()]
+            logits = policy(feature_tensor)
+            probabilities = torch.softmax(logits, dim=0)
+            order = policy_order(logits, generator, 'sample')
+            requested = visible[order.numpy()]
         model.refine_and_decimate(export_mesh=False, candidate_order=requested, max_added_faces=opt.refine_face_budget)
         event = copy.deepcopy(model.refinement_event)
+        considered_count = event['considered_count']
+        actions = np.zeros(len(visible), dtype=bool)
+        actions[order[:considered_count].numpy()] = True
+        for face in requested[considered_count:]:
+            event['request_status'][int(face)] = 'budget_not_considered'
         parents = model.parent_face_id.cpu().numpy().copy()
         if len(model.triangles) - count != event['added_faces']:
             raise RuntimeError('Mesh change does not match recorded face budget')
@@ -278,7 +346,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         transitions.append({'round': global_round + 1, 'faces_before': count, 'faces_after': len(model.triangles),
                             'global_step': trainer.global_step, 'training_indices': indices, 'event': event,
                             'visible': visible, 'features': features, 'feature_scales': scales,
-                            'actions': actions.numpy(), 'probabilities': probabilities.numpy(),
+                            'actions': actions, 'probabilities': probabilities.numpy(),
+                            'selection_order': order.numpy(), 'considered_count': considered_count,
                             'parent_face_id': parents, 'child_areas': child_areas, 'costs': costs,
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
                             'sil_before': sil_before, 'sil_after': sil_after, 'reward': rewards,
@@ -304,7 +373,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'rgb_before': _json_values(transition['rgb_before']), 'rgb_after': _json_values(transition['rgb_after']),
                       'sil_before': _json_values(transition['sil_before']), 'sil_after': _json_values(transition['sil_after']),
                       'local_reward': _json_values(transition['reward']), 'lineage_return': None,
+                      'reward_distributions': reward_distributions(transition, weights),
                       'policy_loss': None, 'evaluation': transition['evaluation']}
+            record.update(action_counts(transition))
             with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}_pending.json'.format(transition['round'])), 'w') as output:
                 json.dump(record, output, indent=2, allow_nan=False)
         with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
@@ -313,13 +384,12 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         return
 
     returns = lineage_returns(transitions, opt.refine_multiround_gamma)
-    objective, losses = joint_policy_loss(policy, transitions, returns)
-    if losses:
+    losses = face_policy_losses(policy, transitions, returns)
+    valid_losses = [loss for loss in losses if loss is not None]
+    if valid_losses:
         optimizer.zero_grad()
-        torch.stack(losses).sum().backward()
+        torch.stack(valid_losses).sum().backward()
         optimizer.step()
-    else:
-        losses = [None] * len(transitions)
     for t, (transition, values, loss) in enumerate(zip(transitions, returns, losses)):
         event = transition['event']
         passive_faces = set(event['passive_faces'])
@@ -328,10 +398,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         record = {'round': transition['round'], 'faces_before': transition['faces_before'],
                   'faces_after': transition['faces_after'], 'global_step': transition['global_step'],
                   'training_indices': transition['training_indices'], 'event': event,
-                  'requested_count': int(transition['actions'].sum()),
                   'executed_edges': len(event['executed_edges']), 'added_faces': event['added_faces'],
                   'policy_loss': transition['policy_loss'],
-                  'segment_objective': objective, 'segment_horizon': horizon,
+                  'reward_distributions': reward_distributions(transition, weights, values),
+                  'segment_horizon': horizon,
                   'segment_start_round': transitions[0]['round'],
                   'segment_terminal_round': transitions[-1]['round'],
                   'parent_face_id': transition['parent_face_id'].tolist(),
@@ -347,6 +417,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'rgb_before': _json_values(transition['rgb_before']), 'rgb_after': _json_values(transition['rgb_after']),
                   'sil_before': _json_values(transition['sil_before']), 'sil_after': _json_values(transition['sil_after']),
                   'local_reward': _json_values(transition['reward']), 'lineage_return': _json_values(values)}
+        record.update(action_counts(transition))
         with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}.json'.format(transition['round'])), 'w') as output:
             json.dump(record, output, indent=2, allow_nan=False)
     snapshot(True)

@@ -9,7 +9,8 @@ import numpy as np
 import torch
 
 from meshutils import subdivide_longest_edges
-from nerf.refinement_multiround import edge_costs, lineage_returns, local_rewards, _region_stats, _silhouette_owners, joint_policy_loss
+from nerf.refinement_multiround import (edge_costs, lineage_returns, local_rewards, _region_stats,
+                                        _silhouette_owners, face_policy_losses, reward_distributions, action_counts)
 from nerf import refinement_multiround
 from nerf.refinement_rl import FacePolicy
 
@@ -28,7 +29,7 @@ class MultiRoundTest(unittest.TestCase):
         np.testing.assert_allclose(last, [0.0, 0.5])
         np.testing.assert_array_equal(_silhouette_owners(np.full(5, -1), target, (1, 5), 2), np.full(5, -1))
 
-    def test_joint_score_includes_hold_and_failed_requests(self):
+    def test_face_returns_change_the_corresponding_ranking_gradient(self):
         class Logits(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -36,13 +37,35 @@ class MultiRoundTest(unittest.TestCase):
             def forward(self, x):
                 return self.values
         policy = Logits()
-        transition = {'features': np.zeros((3, 3), dtype=np.float32),
-                      'actions': np.array([False, True, True]),
-                      'event': {'request_status': {1: 'conflict', 2: 'budget'}}}
-        objective, losses = joint_policy_loss(policy, [transition], [np.array([1.0])])
-        self.assertEqual(objective, 1.0)
+        transition = {'features': np.zeros((3, 3), dtype=np.float32), 'visible': np.arange(3),
+                      'selection_order': np.array([0, 1, 2]), 'considered_count': 2,
+                      'event': {'request_status': {0: 'executed', 1: 'conflict', 2: 'budget_not_considered'},
+                                'considered_count': 2, 'executed_edges': [[0, 1]]}}
+        losses = face_policy_losses(policy, [transition], [np.array([2., -1., 100.])])
         losses[0].backward()
-        torch.testing.assert_close(policy.values.grad, torch.tensor([0.5, -0.5, -0.5]))
+        # Face 2 is unconsidered, but affects both Plackett-Luce denominators.
+        torch.testing.assert_close(policy.values.grad, torch.tensor([-4/3, 7/6, 1/6]))
+        counts = action_counts(transition)
+        self.assertEqual(counts['executed_request_count'], 1)
+        self.assertEqual(counts['conflict_count'], 1)
+        self.assertEqual(counts['budget_not_considered_count'], 1)
+        transition['event']['request_status'][1] = 'budget'
+        self.assertEqual(action_counts(transition)['budget_rejected_count'], 1)
+        policy.zero_grad()
+        losses = face_policy_losses(policy, [transition], [np.array([2., 1., 100.])])
+        losses[0].backward()
+        torch.testing.assert_close(policy.values.grad, torch.tensor([-4/3, 1/6, 7/6]))
+
+    def test_reward_components_distribution(self):
+        transition = {'reward_pixels': np.array([2, 1, 0]), 'sil_before': np.array([.5, .8, 0]),
+                      'sil_after': np.array([.3, .5, 0]), 'rgb_before': np.array([.7, .4, 0]),
+                      'rgb_after': np.array([.4, .3, 0]), 'costs': np.array([2, 0, 0]),
+                      'reward': np.array([.7, .9, np.nan])}
+        result = reward_distributions(transition, [2., 3., .2], np.array([1., -1., np.nan]))
+        self.assertAlmostEqual(result['silhouette']['sum'], 1.)
+        self.assertAlmostEqual(result['rgb']['sum'], 1.2)
+        self.assertAlmostEqual(result['face_cost']['sum'], -.4)
+        self.assertEqual(result['lineage_return']['count'], 2)
 
     def test_local_reward_and_invalid_observation(self):
         counts = np.array([2, 0])
@@ -185,6 +208,7 @@ class MultiRoundTest(unittest.TestCase):
             legacy = copy.deepcopy(full_state)
             legacy['config'].pop('horizon')
             legacy['config'].pop('silhouette_radius')
+            legacy['config'].pop('policy_objective')
             legacy['config']['pixel_regions'] = 'pre-update face index for each reward-view pixel'
             legacy_path = os.path.join(directory, 'legacy.pt')
             torch.save(legacy, legacy_path)
@@ -196,6 +220,7 @@ class MultiRoundTest(unittest.TestCase):
             restored = torch.load(os.path.join(legacy_dir, 'trajectory.pt'), map_location='cpu')
             self.assertEqual(len(restored['history']), 3)
             self.assertEqual(restored['transitions'][0]['round'], 4)
+            self.assertEqual(len(restored['policy_optimizer']['state']), 0)
             # A six-round segment resumed after round three matches an uninterrupted segment.
             paths = [os.path.join(directory, name) for name in ('full_six', 'first_three', 'last_three')]
             for path in paths:
@@ -210,6 +235,16 @@ class MultiRoundTest(unittest.TestCase):
             pending = torch.load(os.path.join(paths[1], 'trajectory.pt'), map_location='cpu')
             self.assertFalse(pending['completed'])
             self.assertEqual(len(pending['transitions']), 3)
+            old_pending = copy.deepcopy(pending)
+            old_pending['config'].pop('policy_objective')
+            old_pending_path = os.path.join(directory, 'old_open.pt')
+            torch.save(old_pending, old_pending_path)
+            old_open_dir = os.path.join(directory, 'old_open')
+            os.mkdir(old_open_dir)
+            old_open = make_trainer(old_open_dir, ckpt, mesh, old_pending_path)
+            old_open.opt.refine_multiround_horizon = 6
+            with self.assertRaisesRegex(ValueError, 'open segment'):
+                refinement_multiround.run_multiround(old_open, Dataset(), Dataset(), [0], [1])
             last_three = make_trainer(paths[2], ckpt, mesh, os.path.join(paths[1], 'trajectory.pt'))
             last_three.opt.refine_multiround_horizon = 6
             refinement_multiround.run_multiround(last_three, Dataset(), Dataset(), [0], [1])
