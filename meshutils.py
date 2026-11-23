@@ -189,7 +189,7 @@ def clean_mesh(verts, faces, v_pct=1, min_f=8, min_d=5, repair=True, remesh=True
 
 
 def subdivide_longest_edges(verts, faces, candidates, return_event=False,
-                            candidate_order=None, max_added_faces=None):
+                            candidate_order=None, max_added_faces=None, decision_fn=None):
     """Split requested longest edges and return each output face's input index.
 
     Conflicting requests are processed in face index order. An edge is skipped
@@ -214,6 +214,8 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     request_status = {}
     if max_added_faces is not None and max_added_faces < 0:
         raise ValueError('max_added_faces must be nonnegative')
+    if decision_fn is not None and max_added_faces is None:
+        raise ValueError('Sequential decisions require a finite face budget')
     if candidate_order is None:
         candidate_order = np.flatnonzero(candidates)
     else:
@@ -227,18 +229,22 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     additions = []
     considered_count = 0
     for face_id in candidate_order:
-        if max_added_faces is not None and added_faces >= max_added_faces:
+        if decision_fn is None and max_added_faces is not None and added_faces >= max_added_faces:
             processed.append(int(face_id))
             request_status[int(face_id)] = 'budget'
             continue
-        processed.append(int(face_id))
         considered_count += 1
+        if decision_fn is not None and not decision_fn(int(face_id), max_added_faces - added_faces):
+            request_status[int(face_id)] = 'hold'
+            continue
+        processed.append(int(face_id))
         face = faces[face_id]
         edges = [(int(face[i]), int(face[(i + 1) % 3])) for i in range(3)]
         lengths = [np.sum((verts[a] - verts[b]) ** 2) for a, b in edges]
         edge = tuple(sorted(edges[int(np.argmax(lengths))]))
         if edge in requested_edges:
-            request_status[int(face_id)] = edge_results[edge]
+            request_status[int(face_id)] = ('already_split' if decision_fn is not None and
+                                            edge_results[edge] == 'executed' else edge_results[edge])
             continue
         requested_edges.add(edge)
         incident_faces = edge_faces[edge]

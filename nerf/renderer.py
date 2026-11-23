@@ -194,7 +194,7 @@ class NeRFRenderer(nn.Module):#
         print(f'[INFO] update_aabb: {self.aabb_train.cpu().numpy().tolist()}')
 
     @torch.no_grad()
-    def refine_and_decimate(self, export_mesh=True, candidate_order=None, max_added_faces=None): #自适应网格细化的核心函数
+    def refine_and_decimate(self, export_mesh=True, candidate_order=None, max_added_faces=None, decision_fn=None): #自适应网格细化的核心函数
         #1.确保当前处于stage1
         assert self.opt.stage > 0
         #2.保存设备信息
@@ -253,7 +253,7 @@ class NeRFRenderer(nn.Module):#
             #refine_decimate_ratio 0.1 低误差区域简化比例 refine_size 0.01 高误差区域细分的边长阈值
             #refine_remesh_size 0.02 简化区域重新网格化的目标边长
             if local_refine:
-                v, f, parent_face_id, event = subdivide_longest_edges(v, f, mask == 2, return_event=True, candidate_order=candidate_order, max_added_faces=max_added_faces)
+                v, f, parent_face_id, event = subdivide_longest_edges(v, f, mask == 2, return_event=True, candidate_order=candidate_order, max_added_faces=max_added_faces, decision_fn=decision_fn)
             else:
                 v, f = decimate_and_refine_mesh(v, f, mask, decimate_ratio=self.opt.refine_decimate_ratio, refine_size=self.opt.refine_size, refine_remesh_size=self.opt.refine_remesh_size)
             
@@ -294,7 +294,7 @@ class NeRFRenderer(nn.Module):#
                 #18.只细化内层网格
                 if cas == 0:
                     if local_refine:
-                        cur_v, cur_f, parent_face_id, event = subdivide_longest_edges(cur_v, cur_f, mask == 2, return_event=True)
+                        cur_v, cur_f, parent_face_id, event = subdivide_longest_edges(cur_v, cur_f, mask == 2, return_event=True, candidate_order=candidate_order, max_added_faces=max_added_faces, decision_fn=decision_fn)
                     else:
                         cur_v, cur_f = decimate_and_refine_mesh(cur_v, cur_f, mask, decimate_ratio=self.opt.refine_decimate_ratio, refine_size=self.opt.refine_size, refine_remesh_size=self.opt.refine_remesh_size)
                 elif local_refine:

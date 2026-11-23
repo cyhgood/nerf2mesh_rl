@@ -12,7 +12,8 @@ from scipy.ndimage import binary_erosion, distance_transform_edt
 from nerf.refinement_experiment import _select_views, _train_branch, _warmup_vertex_ema
 from nerf.refinement_multiround import _observe_silhouette, _region_stats
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256
-from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION, candidate_features, remap_vertex_ema, visibility_counts
+from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, SequentialFaceDecisions,
+                                        candidate_features, remap_vertex_ema, visibility_counts)
 from nerf.refinement_attribution import edge_outcomes
 
 
@@ -30,6 +31,7 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
                                      'min_area': options.get('refine_min_face_area', 1e-12),
                                      'ema_beta': options.get('refine_gradient_ema_beta', 0.9),
                                      'training_ema_warmup_steps': options.get('refine_gradient_ema_warmup_steps', 0)}
+        policy.training_objective = config.get('policy_objective', 'unknown')
     try:
         policy.load_state_dict(trajectory['policy'])
     except RuntimeError as error:
@@ -191,8 +193,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     result['rl_policy_feature_version'] = FEATURE_VERSION if isinstance(policy, CandidatePolicy) else 'legacy_three_features'
     result['rl_vertex_ema_initialization'] = 'zeros on starting Stage 1 mesh followed by recorded warmup optimization steps'
     if isinstance(policy, CandidatePolicy):
-        result['rl_selection'] = 'area-filtered candidates, sigmoid probability >= 0.5, descending score, then budget'
+        result['rl_selection'] = 'area order; sequential sigmoid threshold decisions using current remaining budget'
         result['rl_candidate_settings'] = policy.candidate_settings
+        result['rl_training_objective'] = policy.training_objective
 
     branches = [('rl', None), ('high_error', None)] + [('random', seed) for seed in seeds]
     _save_json(os.path.join(opt.refine_experiment_output, 'multibranch_metadata.json'), result)
@@ -217,6 +220,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             model.triangles_errors_cnt = torch.tensor(counts, dtype=torch.float32, device=trainer.device)
             visible = np.flatnonzero(counts > 0)
             candidate_info = None
+            decisions = None
             candidate_mask = np.zeros(face_count, dtype=bool)
             candidate_feature_values = np.full((face_count, 9), np.nan, dtype=np.float32)
             request_probability = np.full(face_count, np.nan, dtype=np.float32)
@@ -226,16 +230,11 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                     _, _, view_counts = visibility_counts(observations, face_count)
                     visible, features, candidate_info = candidate_features(
                         vertices, faces, sums, counts, view_counts, len(selection_views),
-                        vertex_state['ema'], vertex_state['seen'], round_budget / opt.refine_face_budget,
+                        vertex_state['ema'], vertex_state['seen'], 1.0 if round_budget else 0.0,
                         policy.candidate_settings['fraction'], policy.candidate_settings['min_area'])
                     candidate_mask[visible] = True
-                    with torch.no_grad():
-                        logits = policy(torch.from_numpy(features))
-                        scores = logits.numpy()
-                        request_probability[visible] = torch.sigmoid(logits).numpy()
-                    candidate_feature_values[visible] = features
-                    requested = np.flatnonzero(scores >= 0)
-                    order = visible[requested[np.argsort(-scores[requested], kind='stable')]]
+                    decisions = SequentialFaceDecisions(policy, visible, features, round_budget, deterministic=True)
+                    order = visible
                 else:
                     visible, features, _ = face_features(vertices, faces, sums, counts)
                     candidate_mask[visible] = True
@@ -248,7 +247,13 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                 order = random_generator.permutation(visible)
             else:
                 order = visible
-            model.refine_and_decimate(export_mesh=False, candidate_order=order, max_added_faces=round_budget)
+            if decisions is None:
+                model.refine_and_decimate(export_mesh=False, candidate_order=order, max_added_faces=round_budget)
+            else:
+                model.refine_and_decimate(export_mesh=False, candidate_order=order,
+                                          max_added_faces=round_budget, decision_fn=decisions)
+                request_probability[visible] = decisions.probabilities
+                candidate_feature_values[visible] = decisions.features
             event = copy.deepcopy(model.refinement_event)
             actual = len(model.triangles) - face_count
             if actual != event['added_faces'] or actual > round_budget:
@@ -285,13 +290,18 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                 min_contour_distance_pixels=min_distance, status=status,
                                 passive=passive, executed_requester=executed, candidate=candidate_mask,
                                 candidate_features=candidate_feature_values, request_probability=request_probability,
+                                decision_mask=decisions.decided if decisions is not None else np.array([], dtype=bool),
+                                decision_face_ids=visible if decisions is not None else np.array([], dtype=np.int64),
+                                remaining_budget=decisions.remaining if decisions is not None else np.array([], dtype=np.int64),
+                                decision_log_probability=decisions.log_probabilities if decisions is not None else np.array([], dtype=np.float64),
                                 rgb_evaluation_pixels=rgb_counts, rgb_before=rgb_before, rgb_after=rgb_after,
                                 silhouette_evaluation_pixels=sil_counts, silhouette_before=sil_before, silhouette_after=sil_after)
             metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
                                          evaluation_views, shapes)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
                                      'faces_after': len(model.triangles), 'visible_candidates': len(visible),
-                                     'requested_count': len(order), 'hold_count': len(visible) - len(order),
+                                     'requested_count': int(np.count_nonzero(decisions.actions)) if decisions is not None else len(order),
+                                     'hold_count': int(np.count_nonzero(decisions.decided & ~decisions.actions)) if decisions is not None else len(visible) - len(order),
                                      'executed_request_count': sum(
                                          event['request_status'][int(face)] == 'executed'
                                          for face in order[:event['considered_count']]),
@@ -299,7 +309,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                          event['request_status'][int(face)] == 'conflict'
                                          for face in order[:event['considered_count']]),
                                      'budget_unexecuted_count': sum(
-                                         event['request_status'][int(face)] == 'budget' for face in order),
+                                         event['request_status'][int(face)] in ('budget', 'budget_not_considered') for face in order),
                                      'round_budget': round_budget, 'actual_added_faces': actual,
                                      'face_observations': observations_file, 'contour_views': contour_views,
                                      'candidate_info': candidate_info,

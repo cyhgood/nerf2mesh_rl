@@ -12,11 +12,11 @@ from scipy.ndimage import distance_transform_edt
 from nerf.refinement_experiment import _fixed_region_means, _observe, _select_views, _train_branch, _warmup_vertex_ema
 from nerf.refinement_rl import file_sha256
 from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candidate_features,
-                                        remap_vertex_ema, visibility_counts)
+                                        remap_vertex_ema, visibility_counts, SequentialFaceDecisions)
 from nerf.refinement_attribution import edge_outcomes
 
 
-POLICY_OBJECTIVE = 'candidate_bernoulli_ema_v3'
+POLICY_OBJECTIVE = 'candidate_sequential_budget_v4'
 
 
 def edge_costs(event, face_count):
@@ -73,8 +73,20 @@ def face_policy_losses(policy, transitions, returns, baseline='none', scale='non
             losses.append(None)
             stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
             continue
-        values = face_returns[visible]
-        valid = np.isfinite(values)
+        values = face_returns[visible].copy()
+        event = transition.get('event', {})
+        passive = set(map(int, event.get('passive_faces', [])))
+        locations = {int(face): i for i, face in enumerate(visible)}
+        for edge in event.get('edge_events', []):
+            owner = int(edge['requester_face'])
+            if owner not in locations or not np.isfinite(values[locations[owner]]):
+                continue
+            for face in edge['affected_faces']:
+                face = int(face)
+                if face in passive and np.isfinite(face_returns[face]):
+                    values[locations[owner]] += face_returns[face]
+        decided = np.asarray(transition.get('decision_mask', np.ones(len(visible), dtype=bool)), dtype=bool)
+        valid = np.isfinite(values) & decided & ~np.isin(visible, list(passive))
         if not valid.any():
             losses.append(None)
             stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
@@ -131,7 +143,7 @@ def grouped_rewards(transition, weights, returns=None):
     executed = {int(edge['requester_face']) for edge in event['edge_events']}
     passive = set(map(int, event['passive_faces']))
     unexecuted = {int(face) for face, status in event['request_status'].items()
-                  if status in ('conflict', 'budget')}
+                  if status in ('conflict', 'budget', 'already_split')}
     not_considered = {int(face) for face, status in event['request_status'].items()
                       if status == 'budget_not_considered'}
     result = {}
@@ -145,14 +157,16 @@ def action_counts(transition):
     event = transition['event']
     statuses = list(event['request_status'].values())
     considered = event['considered_count']
-    return {'requested_count': int(np.count_nonzero(transition['actions'])),
-            'hold_count': int(len(transition['visible']) - np.count_nonzero(transition['actions'])),
+    decided = np.asarray(transition.get('decision_mask', np.ones(len(transition['visible']), dtype=bool)))
+    return {'requested_count': int(np.count_nonzero(transition['actions'] & decided)),
+            'hold_count': int(np.count_nonzero(~transition['actions'] & decided)),
             'considered_count': considered,
             'executed_request_count': statuses.count('executed'),
             'executed_edge_count': len(event['executed_edges']),
             'conflict_count': statuses.count('conflict'),
             'budget_rejected_count': statuses.count('budget'),
-            'budget_not_considered_count': statuses.count('budget_not_considered')}
+            'budget_not_considered_count': statuses.count('budget_not_considered'),
+            'already_split_count': statuses.count('already_split')}
 
 
 def _observe_silhouette(trainer, dataset, views, training_dataset=False):
@@ -262,6 +276,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'lineage_weights': 'child area after optimization normalized over each parent',
               'cost_allocation': 'all faces added by an edge charged once to its first executing requester',
               'policy_objective': POLICY_OBJECTIVE,
+              'budget_decision_mode': 'area order, sequential remaining/per-round budget',
               'feature_version': FEATURE_VERSION,
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
               'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
@@ -296,6 +311,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         old_radius = old_config.pop('silhouette_radius', None)
         old_objective = old_config.pop('policy_objective', None)
         requested_config.pop('policy_objective')
+        old_config.pop('budget_decision_mode', None)
+        requested_config.pop('budget_decision_mode')
         old_feature_version = old_config.pop('feature_version', None)
         requested_config.pop('feature_version')
         requested_config.pop('horizon')
@@ -345,8 +362,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         trainer.global_step = saved['global_step']
         if old_feature_version == FEATURE_VERSION:
             policy.load_state_dict(saved['policy'])
-        if old_objective == POLICY_OBJECTIVE and old_feature_version == FEATURE_VERSION:
-            optimizer.load_state_dict(saved['policy_optimizer'])
+        if old_feature_version == FEATURE_VERSION:
+            if old_objective == POLICY_OBJECTIVE:
+                optimizer.load_state_dict(saved['policy_optimizer'])
+            else:
+                trainer.log('[INFO] policy objective changed; retained policy and EMA with a fresh policy optimizer')
             if any(key not in saved for key in ('vertex_gradient_ema', 'vertex_gradient_seen', 'vertex_mapping')):
                 raise ValueError('Candidate-policy checkpoint is missing vertex EMA or mapping')
             vertex_state = {'ema': np.asarray(saved['vertex_gradient_ema'], dtype=np.float64),
@@ -404,19 +424,12 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
             len(selection_views), vertex_state['ema'], vertex_state['seen'], 1.0,
             candidate_fraction, min_area)
-        feature_tensor = torch.from_numpy(features)
-        with torch.no_grad():
-            logits = policy(feature_tensor)
-            probabilities = torch.sigmoid(logits)
-            actions = (torch.rand(len(visible), generator=generator) < probabilities).numpy()
-            requested_positions = np.flatnonzero(actions)
-            requested_positions = requested_positions[np.argsort(-logits.numpy()[requested_positions], kind='stable')]
-            requested = visible[requested_positions]
-        model.refine_and_decimate(export_mesh=False, candidate_order=requested, max_added_faces=opt.refine_face_budget)
+        decisions = SequentialFaceDecisions(policy, visible, features, opt.refine_face_budget, generator=generator)
+        model.refine_and_decimate(export_mesh=False, candidate_order=visible,
+                                  max_added_faces=opt.refine_face_budget, decision_fn=decisions)
         event = copy.deepcopy(model.refinement_event)
         considered_count = event['considered_count']
-        for face in requested[considered_count:]:
-            event['request_status'][int(face)] = 'budget_not_considered'
+        actions = decisions.actions
         parents = model.parent_face_id.cpu().numpy().copy()
         if len(model.triangles) - count != event['added_faces']:
             raise RuntimeError('Mesh change does not match recorded face budget')
@@ -451,10 +464,12 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                           'sil_after': float(np.average(eval_sil_after[valid_eval_sil], weights=eval_sil_counts[valid_eval_sil])) if valid_eval_sil.any() else None}
         transitions.append({'round': global_round + 1, 'faces_before': count, 'faces_after': len(model.triangles),
                             'global_step': trainer.global_step, 'training_indices': indices, 'event': event,
-                            'visible': visible, 'features': features, 'feature_scales': np.asarray(feature_info['normalization_scales']),
+                            'visible': visible, 'features': decisions.features, 'feature_scales': np.asarray(feature_info['normalization_scales']),
                             'candidate_info': feature_info, 'vertex_mapping': vertex_mapping,
-                            'actions': actions, 'probabilities': probabilities.numpy(),
-                            'selection_order': requested_positions, 'considered_count': considered_count,
+                            'actions': actions, 'probabilities': decisions.probabilities,
+                            'decision_mask': decisions.decided, 'decision_log_probabilities': decisions.log_probabilities,
+                            'decision_order': visible[decisions.decided].copy(), 'round_budget': opt.refine_face_budget,
+                            'remaining_budget': decisions.remaining, 'considered_count': considered_count,
                             'parent_face_id': parents, 'child_areas': child_areas, 'costs': costs,
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
                             'sil_before': sil_before, 'sil_after': sil_after, 'reward': rewards,
@@ -471,7 +486,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'faces_before': transition['faces_before'], 'faces_after': transition['faces_after'],
                       'global_step': transition['global_step'], 'training_indices': transition['training_indices'],
                       'visible_face_ids': transition['visible'].tolist(), 'actions': transition['actions'].tolist(),
-                      'probabilities': transition['probabilities'].tolist(),
+                      'probabilities': _json_values(transition['probabilities']),
+                      'decision_mask': transition['decision_mask'].tolist(),
+                      'decision_order': transition['decision_order'].tolist(), 'round_budget': transition['round_budget'],
+                      'decision_log_probabilities': _json_values(transition['decision_log_probabilities']),
+                      'remaining_budget': transition['remaining_budget'].tolist(),
                       'candidate_info': transition['candidate_info'],
                       'candidate_features': transition['features'].tolist(),
                       'vertex_mapping': transition['vertex_mapping'].tolist(),
@@ -536,7 +555,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'action_status': [event['request_status'].get(int(face), 'hold')
                                     for face in transition['visible']],
                   'passively_split': [int(face) in passive_faces for face in transition['visible']],
-                  'probabilities': transition['probabilities'].tolist(),
+                  'probabilities': _json_values(transition['probabilities']),
+                  'decision_mask': transition['decision_mask'].tolist(),
+                  'decision_order': transition['decision_order'].tolist(), 'round_budget': transition['round_budget'],
+                  'decision_log_probabilities': _json_values(transition['decision_log_probabilities']),
+                  'remaining_budget': transition['remaining_budget'].tolist(),
                   'candidate_info': transition['candidate_info'],
                   'candidate_features': transition['features'].tolist(),
                   'vertex_mapping': transition['vertex_mapping'].tolist(),

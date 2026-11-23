@@ -55,13 +55,13 @@ class MultiBranchTest(unittest.TestCase):
                 self.v_cumsum = np.array([0, 4])
                 self.f_cumsum = np.array([0, 2])
 
-            def refine_and_decimate(self, export_mesh, candidate_order, max_added_faces):
+            def refine_and_decimate(self, export_mesh, candidate_order, max_added_faces, decision_fn=None):
                 starts.append((len(self.triangles), float(self.color.detach()), self.vertices.clone(),
                                self.vertices_offsets.detach().clone()))
                 candidates = np.isin(np.arange(len(self.triangles)), candidate_order)
                 vertices, faces, parent, event = subdivide_longest_edges(
                     (self.vertices + self.vertices_offsets).detach().numpy(), self.triangles.numpy(),
-                    candidates, True, candidate_order, max_added_faces)
+                    candidates, True, candidate_order, max_added_faces, decision_fn)
                 self.vertices = torch.tensor(vertices)
                 self.triangles = torch.tensor(faces)
                 self.vertices_offsets = torch.nn.Parameter(torch.zeros_like(self.vertices))

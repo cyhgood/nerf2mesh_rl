@@ -145,11 +145,11 @@ class MultiRoundTest(unittest.TestCase):
                 self.v_cumsum = np.array([0, 4])
                 self.f_cumsum = np.array([0, 2])
 
-            def refine_and_decimate(self, export_mesh, candidate_order, max_added_faces):
+            def refine_and_decimate(self, export_mesh, candidate_order, max_added_faces, decision_fn=None):
                 mask = np.isin(np.arange(len(self.triangles)), candidate_order)
                 verts, faces, parent, event = subdivide_longest_edges(
                     (self.vertices + self.vertices_offsets).detach().numpy(), self.triangles.numpy(),
-                    mask, True, candidate_order, max_added_faces)
+                    mask, True, candidate_order, max_added_faces, decision_fn)
                 self.vertices = torch.tensor(verts)
                 self.triangles = torch.tensor(faces)
                 self.vertices_offsets = torch.nn.Parameter(torch.zeros_like(self.vertices))
@@ -265,6 +265,21 @@ class MultiRoundTest(unittest.TestCase):
             self.assertEqual(restored['transitions'][0]['round'], 4)
             self.assertEqual(restored['ema_initialization'], 'legacy_mesh_zero_ema_and_reinitialized_policy')
             self.assertEqual(len(restored['policy_optimizer']['state']), 0)
+            static_budget = copy.deepcopy(full_state)
+            static_budget['config']['policy_objective'] = 'candidate_bernoulli_ema_v3'
+            static_budget['config'].pop('budget_decision_mode')
+            static_path = os.path.join(directory, 'static_budget.pt')
+            torch.save(static_budget, static_path)
+            static_dir = os.path.join(directory, 'static_budget_resume')
+            os.mkdir(static_dir)
+            static_trainer = make_trainer(static_dir, ckpt, mesh, static_path)
+            static_trainer.opt.refine_multiround_rounds = 1
+            refinement_multiround.run_multiround(static_trainer, Dataset(), Dataset(), [0], [1])
+            static_state = torch.load(os.path.join(static_dir, 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(len(static_state['policy_optimizer']['state']), 0)
+            self.assertEqual(static_state['ema_initialization'], static_budget['ema_initialization'])
+            for key in static_budget['policy']:
+                torch.testing.assert_close(static_budget['policy'][key], static_state['policy'][key])
             # A six-round segment resumed after round three matches an uninterrupted segment.
             paths = [os.path.join(directory, name) for name in ('full_six', 'first_three', 'last_three')]
             for path in paths:

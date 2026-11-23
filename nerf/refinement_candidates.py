@@ -16,7 +16,7 @@ FEATURE_DEFINITIONS = {
     'normal_angle_log': 'mean dihedral angle in radians over valid manifold neighbors',
     'view_fraction': 'number of selection views seeing the face divided by number of selection views',
     'pixel_count_log': 'total visible pixels over selection views',
-    'round_budget_fraction': 'remaining budget divided by per-round budget at simultaneous decision time',
+    'round_budget_fraction': 'remaining budget divided by per-round budget immediately before each decision',
     'gradient_missing': 'one when at least one vertex EMA has not been observed',
     'curvature_missing': 'one when no valid manifold neighbor exists',
     'normalization': 'log features use log1p(value / candidate positive median), clipped to 5',
@@ -30,6 +30,38 @@ class CandidatePolicy(nn.Module):
 
     def forward(self, features):
         return self.network(features).squeeze(-1)
+
+
+class SequentialFaceDecisions:
+    """Record exactly the state and Bernoulli action used before each edge attempt."""
+    def __init__(self, policy, candidates, features, budget, generator=None, deterministic=False):
+        self.policy = policy
+        self.positions = {int(face): index for index, face in enumerate(candidates)}
+        self.features = features.copy()
+        self.budget = budget
+        self.generator = generator
+        self.deterministic = deterministic
+        self.actions = np.zeros(len(candidates), dtype=bool)
+        self.decided = np.zeros(len(candidates), dtype=bool)
+        self.probabilities = np.full(len(candidates), np.nan)
+        self.log_probabilities = np.full(len(candidates), np.nan)
+        self.remaining = np.full(len(candidates), -1, dtype=np.int64)
+
+    def __call__(self, face_id, remaining):
+        index = self.positions[face_id]
+        self.features[index, 6] = remaining / self.budget if self.budget else 0.0
+        with torch.no_grad():
+            logits = self.policy(torch.from_numpy(self.features[index:index + 1]))[0]
+            probability = torch.sigmoid(logits)
+            action = bool(probability >= .5) if self.deterministic else bool(
+                torch.rand((), generator=self.generator) < probability)
+            log_probability = torch.nn.functional.logsigmoid(logits if action else -logits)
+        self.actions[index] = action
+        self.decided[index] = True
+        self.probabilities[index] = float(probability)
+        self.log_probabilities[index] = float(log_probability)
+        self.remaining[index] = remaining
+        return action
 
 
 def visibility_counts(observations, face_count):
