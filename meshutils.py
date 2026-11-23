@@ -188,7 +188,8 @@ def clean_mesh(verts, faces, v_pct=1, min_f=8, min_d=5, repair=True, remesh=True
     return verts, faces
 
 
-def subdivide_longest_edges(verts, faces, candidates, return_event=False):
+def subdivide_longest_edges(verts, faces, candidates, return_event=False,
+                            candidate_order=None, max_added_faces=None):
     """Split requested longest edges and return each output face's input index.
 
     Conflicting requests are processed in face index order. An edge is skipped
@@ -210,7 +211,23 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False):
     edge_results = {}
     executed_edges = []
     request_status = {}
-    for face_id in np.flatnonzero(candidates):
+    if max_added_faces is not None and max_added_faces < 0:
+        raise ValueError('max_added_faces must be nonnegative')
+    if candidate_order is None:
+        candidate_order = np.flatnonzero(candidates)
+    else:
+        candidate_order = np.asarray(candidate_order, dtype=np.int64)
+        if (candidate_order.ndim != 1 or len(np.unique(candidate_order)) != len(candidate_order)
+                or np.any(candidate_order < 0) or np.any(candidate_order >= len(faces))
+                or not np.all(candidates[candidate_order])):
+            raise ValueError('candidate_order must contain unique candidate face indices')
+    processed = []
+    added_faces = 0
+    additions = []
+    for face_id in candidate_order:
+        if max_added_faces is not None and added_faces >= max_added_faces:
+            break
+        processed.append(int(face_id))
         face = faces[face_id]
         edges = [(int(face[i]), int(face[(i + 1) % 3])) for i in range(3)]
         lengths = [np.sum((verts[a] - verts[b]) ** 2) for a, b in edges]
@@ -224,9 +241,15 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False):
             edge_results[edge] = 'conflict'
             request_status[int(face_id)] = 'conflict'
             continue
+        if max_added_faces is not None and added_faces + len(incident_faces) > max_added_faces:
+            edge_results[edge] = 'budget'
+            request_status[int(face_id)] = 'budget'
+            continue
         edge_results[edge] = 'executed'
         request_status[int(face_id)] = 'executed'
         executed_edges.append(list(edge))
+        added_faces += len(incident_faces)
+        additions.append(added_faces)
         midpoint_id = len(new_vertices)
         new_vertices.append((verts[edge[0]] + verts[edge[1]]) * 0.5)
         for index in incident_faces:
@@ -253,10 +276,11 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False):
     if return_event:
         successful = {face for face, status in request_status.items() if status == 'executed'}
         passive = sorted(set(split_faces) - successful)
-        return result + ({'requested_faces': np.flatnonzero(candidates).tolist(),
+        return result + ({'requested_faces': processed,
                           'request_status': request_status,
                           'executed_edges': executed_edges,
-                          'passive_faces': passive},)
+                          'passive_faces': passive, 'added_faces': added_faces,
+                          'cumulative_added_faces': additions},)
     return result
 
 

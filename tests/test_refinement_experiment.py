@@ -10,12 +10,31 @@ import torch
 
 from meshutils import subdivide_longest_edges
 from nerf.refinement_experiment import (
-    _child_observations, _fixed_region_means, _foreground_errors, _select_views,
+    _child_observations, _fixed_region_means, _foreground_errors, _matched_budget_plans, _select_views,
     run_refinement_experiment,
 )
 
 
 class RefinementExperimentTest(unittest.TestCase):
+    def test_matched_budget_and_random_reproducibility(self):
+        vertices = np.array([[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.],
+                             [3., 0., 0.], [5., 0., 0.], [3., 1., 0.]])
+        faces = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6]], dtype=np.int32)
+        candidates = np.arange(3)
+        errors = np.array([3., 2., 1.])
+        target, high, random_order = _matched_budget_plans(vertices, faces, candidates, errors, 1, 7)
+        self.assertEqual(target, 1)
+        self.assertEqual(high.tolist(), [0, 1, 2])
+        _, _, random_again = _matched_budget_plans(vertices, faces, candidates, errors, 1, 7)
+        np.testing.assert_array_equal(random_order, random_again)
+        for order in (high, random_order):
+            v, f, _, event = subdivide_longest_edges(vertices, faces, [True] * 3, True, order, target)
+            self.assertEqual(len(f) - len(faces), target)
+            self.assertEqual(event['added_faces'], target)
+        # A closed shared edge costs two faces, so an odd budget cannot be reached.
+        target, _, _ = _matched_budget_plans(vertices[:4], faces[:2], np.arange(2), errors[:2], 1, 1)
+        self.assertEqual(target, 0)
+
     def test_view_selection_and_overlap(self):
         self.assertEqual(_select_views(10, 2), ([0, 1], [2, 3]))
         self.assertEqual(_select_views(5, 2, [3, 1], [4, 0]), ([3, 1], [4, 0]))
@@ -65,10 +84,12 @@ class RefinementExperimentTest(unittest.TestCase):
                 self.triangles_errors = torch.zeros(2)
                 self.triangles_errors_cnt = torch.zeros(2)
 
-            def refine_and_decimate(self, export_mesh):
+            def refine_and_decimate(self, export_mesh, candidate_order=None, max_added_faces=None):
+                candidates = [True, False] if candidate_order is None else np.isin(np.arange(2), candidate_order)
                 v, f, parent, self.refinement_event = subdivide_longest_edges(
                     (self.vertices + self.vertices_offsets).detach().numpy(),
-                    self.triangles.numpy(), [True, False], return_event=True)
+                    self.triangles.numpy(), candidates, return_event=True,
+                    candidate_order=candidate_order, max_added_faces=max_added_faces)
                 self.vertices = torch.tensor(v)
                 self.triangles = torch.tensor(f)
                 self.vertices_offsets = torch.nn.Parameter(torch.zeros_like(self.vertices))
@@ -133,6 +154,27 @@ class RefinementExperimentTest(unittest.TestCase):
             self.assertEqual(rows[0]['action_status'], 'executed')
             self.assertEqual(rows[1]['passively_split'], 'True')
             self.assertEqual(rows[0]['refined_error'], rows[0]['control_error'])
+
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 7
+            opt.refine = True
+            opt.refine_compare_random = True
+            opt.refine_face_budget = 3
+            opt.refine_random_seeds = [4, 9]
+            opt.refine_experiment_output = os.path.join(directory, 'comparison')
+            samples.clear()
+            run_refinement_experiment(trainer, Dataset(), Dataset())
+            with open(os.path.join(opt.refine_experiment_output, 'comparison.json')) as file:
+                comparison = json.load(file)
+            self.assertEqual(len(comparison['runs']), 2)
+            self.assertTrue(all(run['matched_added_faces'] == 2 for run in comparison['runs']))
+            for run in comparison['runs']:
+                self.assertEqual(run['branches']['high_error']['actual_added_faces'], 2)
+                self.assertEqual(run['branches']['random']['actual_added_faces'], 2)
+                self.assertEqual(run['branches']['high_error']['event']['parent_face_id'], [0, 0, 1, 1])
+                self.assertEqual(len(run['branches']['random']['foreground_errors_by_view']), 1)
+            self.assertTrue(all(samples[:2] == samples[i:i + 2] for i in range(2, len(samples), 2)))
 
 
 if __name__ == '__main__':

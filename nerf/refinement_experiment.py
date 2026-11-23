@@ -111,6 +111,101 @@ def _train_branch(trainer, dataset, indices, seed):
         trainer.lr_scheduler.step()
 
 
+def _matched_budget_plans(vertices, faces, candidate_ids, errors, budget, seed):
+    from meshutils import subdivide_longest_edges
+
+    if budget < 1:
+        raise ValueError('Face budget must be positive')
+    candidate_ids = np.asarray(candidate_ids, dtype=np.int64)
+    order_error = candidate_ids[np.argsort(-errors[candidate_ids], kind='stable')]
+    order_random = np.random.RandomState(seed).permutation(candidate_ids)
+    candidates = np.zeros(len(faces), dtype=bool)
+    candidates[candidate_ids] = True
+    plans = []
+    for order in (order_error, order_random):
+        _, _, _, event = subdivide_longest_edges(
+            vertices, faces, candidates, return_event=True,
+            candidate_order=order, max_added_faces=budget)
+        plans.append(event)
+    achievable = [set([0] + event['cumulative_added_faces']) for event in plans]
+    matched = max(achievable[0] & achievable[1])
+    return matched, order_error, order_random
+
+
+def _run_random_comparison(trainer, train_data, val_data, before, selection_views,
+                           evaluation_views, indices, model_state, old_vertices,
+                           old_triangles, old_v_cumsum, old_f_cumsum, scaler_state, start_step):
+    opt = trainer.opt
+    budget = opt.refine_face_budget
+    seeds = opt.refine_random_seeds
+    if budget < 1 or not seeds or len(seeds) != len(set(seeds)):
+        raise ValueError('Provide a positive face budget and unique random seeds')
+    if any(seed < 0 or seed > 2**32 - 1 for seed in seeds):
+        raise ValueError('Random seeds must be in [0, 2**32 - 1]')
+
+    model = trainer.model
+    face_count = len(old_triangles)
+    selection_counts = model.triangles_errors_cnt.cpu().numpy().copy()
+    selection_sums = model.triangles_errors.cpu().numpy().copy()
+    errors = np.zeros(face_count, dtype=np.float64)
+    np.divide(selection_sums, selection_counts, out=errors, where=selection_counts > 0)
+    candidates = np.flatnonzero(selection_counts > 0)
+    vertices = (old_vertices + model.vertices_offsets.detach()).cpu().numpy()
+    faces = old_triangles.cpu().numpy()
+
+    def restore():
+        model.vertices = old_vertices.clone()
+        model.triangles = old_triangles.clone()
+        model.vertices_offsets = nn.Parameter(torch.zeros_like(old_vertices))
+        model.v_cumsum = old_v_cumsum.copy()
+        model.f_cumsum = old_f_cumsum.copy()
+        model.load_state_dict(model_state)
+        model.triangles_errors = torch.as_tensor(selection_sums.copy(), device=trainer.device)
+        model.triangles_errors_cnt = torch.as_tensor(selection_counts.copy(), device=trainer.device)
+        trainer.scaler.load_state_dict(scaler_state)
+        trainer.global_step = start_step
+
+    restore()
+    model.vertices = model.vertices + model.vertices_offsets.detach()
+    model.vertices_offsets = nn.Parameter(torch.zeros_like(model.vertices))
+    opt.refine = False
+    _train_branch(trainer, train_data, indices, opt.seed)
+    control = _observe(trainer, val_data, evaluation_views)
+
+    result = {'checkpoint': os.path.abspath(opt.ckpt), 'mesh': os.path.abspath(opt.mesh),
+              'global_step': start_step, 'selection_views': selection_views,
+              'evaluation_views': evaluation_views, 'training_indices': indices,
+              'training_seed': opt.seed, 'steps': opt.refine_experiment_steps,
+              'target_added_faces': budget, 'candidate_pool': 'faces visible in selection views',
+              'budget_rule': 'largest common greedy prefix under target; same actual added faces',
+              'foreground_mask': 'ground-truth alpha > 0, or baseline mesh coverage for RGB images',
+              'error_metric': 'RGB mean SmoothL1', 'runs': []}
+    for seed in seeds:
+        matched, high_order, random_order = _matched_budget_plans(vertices, faces, candidates, errors, budget, seed)
+        run = {'random_seed': seed, 'matched_added_faces': matched, 'branches': {}}
+        for name, order in (('high_error', high_order), ('random', random_order)):
+            restore()
+            model.refine_and_decimate(export_mesh=False, candidate_order=order, max_added_faces=matched)
+            event = copy.deepcopy(model.refinement_event)
+            event['global_step'] = start_step
+            event['parent_face_id'] = model.parent_face_id.cpu().numpy().tolist()
+            actual = len(model.triangles) - face_count
+            if actual != matched or actual != event['added_faces']:
+                raise RuntimeError('Refinement did not produce the matched face budget')
+            _train_branch(trainer, train_data, indices, opt.seed)
+            after = _observe(trainer, val_data, evaluation_views)
+            view_errors, overall = _foreground_errors(before, after, control, evaluation_views)
+            run['branches'][name] = {'actual_added_faces': actual, 'event': event,
+                                      'foreground_errors_by_view': view_errors,
+                                      'foreground_errors_overall': overall}
+        result['runs'].append(run)
+        trainer.log('[INFO] random seed {}: target {} added faces, matched {}'.format(seed, budget, matched))
+
+    with open(os.path.join(opt.refine_experiment_output, 'comparison.json'), 'x') as output:
+        json.dump(result, output, indent=2, allow_nan=False)
+    trainer.log('[INFO] refinement comparison written to ' + opt.refine_experiment_output)
+
+
 def run_refinement_experiment(trainer, train_data, val_data):
     opt = trainer.opt
     if (opt.stage != 1 or opt.refine_mode != 'local' or not opt.refine
@@ -165,6 +260,12 @@ def run_refinement_experiment(trainer, train_data, val_data):
     scaler_state = copy.deepcopy(trainer.scaler.state_dict())
     start_step = trainer.global_step
     indices = np.random.RandomState(opt.seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
+
+    if getattr(opt, 'refine_compare_random', False):
+        _run_random_comparison(trainer, train_data, val_data, before, selection_views,
+                               evaluation_views, indices, model_state, old_vertices,
+                               old_triangles, old_v_cumsum, old_f_cumsum, scaler_state, start_step)
+        return
 
     trainer.model.refine_and_decimate(export_mesh=False)
     parent = trainer.model.parent_face_id.cpu().numpy().copy()
