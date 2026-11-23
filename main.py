@@ -139,6 +139,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_candidate_fraction', type=float, default=0.5, help='fraction of valid faces selected by area')
     parser.add_argument('--refine_min_face_area', type=float, default=1e-12, help='minimum valid triangle area')
     parser.add_argument('--refine_gradient_ema_beta', type=float, default=0.9, help='vertex gradient EMA decay')
+    parser.add_argument('--refine_gradient_ema_warmup_steps', type=int, default=0, help='optimization steps used to initialize vertex gradient EMA before the first refinement')
     parser.add_argument('--refine_reinitialize_legacy_policy', action='store_true', help='reinitialize incompatible completed legacy policy and vertex EMA')
     parser.add_argument('--refine_multiround_resume', type=str, default='', help='resume trajectory checkpoint')
     parser.add_argument('--refine_multibranch_eval', action='store_true', help='compare RL, high-error and random over consecutive refinement rounds')

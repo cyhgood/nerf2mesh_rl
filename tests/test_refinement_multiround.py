@@ -311,6 +311,25 @@ class MultiRoundTest(unittest.TestCase):
                 torch.testing.assert_close(expected['policy'][key], actual['policy'][key])
             for expected_round, actual_round in zip(expected['transitions'], actual['transitions']):
                 np.testing.assert_allclose(expected_round['lineage_return'], actual_round['lineage_return'], equal_nan=True)
+            warm_dir = os.path.join(directory, 'warm')
+            warm_resume_dir = os.path.join(directory, 'warm_resume')
+            os.mkdir(warm_dir)
+            os.mkdir(warm_resume_dir)
+            warm = make_trainer(warm_dir, ckpt, mesh)
+            warm.opt.refine_multiround_rounds = 1
+            warm.opt.refine_gradient_ema_warmup_steps = 2
+            refinement_multiround.run_multiround(warm, Dataset(), Dataset(), [0], [1])
+            warm_state = torch.load(os.path.join(warm_dir, 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(warm_state['global_step'], 3)
+            self.assertEqual(warm_state['ema_warmup']['steps'], 2)
+            self.assertIn('edge_outcomes', warm_state['transitions'][0])
+            warm_resume = make_trainer(warm_resume_dir, ckpt, mesh, os.path.join(warm_dir, 'trajectory.pt'))
+            warm_resume.opt.refine_multiround_rounds = 1
+            warm_resume.opt.refine_gradient_ema_warmup_steps = 2
+            refinement_multiround.run_multiround(warm_resume, Dataset(), Dataset(), [0], [1])
+            resumed_warm_state = torch.load(os.path.join(warm_resume_dir, 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(resumed_warm_state['global_step'], 4)
+            self.assertEqual(resumed_warm_state['ema_warmup']['steps'], 2)
 
 
 if __name__ == '__main__':

@@ -127,6 +127,18 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
         trainer.lr_scheduler.step()
 
 
+def _warmup_vertex_ema(trainer, dataset, vertex_state, steps, beta, seed):
+    if steps < 0:
+        raise ValueError('Gradient EMA warmup steps must be nonnegative')
+    warmup_seed = (seed + 104729) % (2 ** 32)
+    indices = np.random.RandomState(warmup_seed).choice(len(dataset.poses), steps).tolist()
+    if steps:
+        _train_branch(trainer, dataset, indices, warmup_seed, vertex_state, beta)
+    return {'method': 'zero_initialization_then_optimization', 'steps': steps,
+            'seed': warmup_seed, 'training_indices': indices,
+            'observed_vertices': int(np.count_nonzero(vertex_state['seen']))}
+
+
 def _matched_budget_plans(vertices, faces, candidate_ids, errors, budget, seed):
     from meshutils import subdivide_longest_edges
 

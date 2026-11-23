@@ -179,6 +179,27 @@ class MultiBranchTest(unittest.TestCase):
                 self.assertEqual(len(candidate_ids), 1)
                 self.assertEqual(saved['candidate_features'][candidate_ids[0], 7], 1.)
                 self.assertGreater(saved['request_probability'][candidate_ids[0]], .5)
+                self.assertIn('rgb_before', saved.files)
+                self.assertIn('silhouette_after', saved.files)
+            self.assertIn('edge_outcomes', rl['rounds'][0])
+
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 10
+            opt.refine = True
+            opt.refine_gradient_ema_warmup_steps = 2
+            opt.refine_experiment_output = os.path.join(directory, 'warmed')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                warmed = json.load(source)
+            self.assertEqual(warmed['ema_warmup']['steps'], 2)
+            self.assertEqual(warmed['initial_global_step'], 12)
+            self.assertEqual(warmed['ema_warmup']['observed_vertices'], 4)
+            self.assertEqual(warmed['branches'][0]['rounds'][0]['candidate_info']['gradient_missing'], 0)
+            self.assertTrue(all(branch['initial_global_step'] == 12 for branch in warmed['branches']))
 
 
 if __name__ == '__main__':

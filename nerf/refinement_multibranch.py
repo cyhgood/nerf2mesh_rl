@@ -9,10 +9,11 @@ import torch
 from torch import nn
 from scipy.ndimage import binary_erosion, distance_transform_edt
 
-from nerf.refinement_experiment import _select_views, _train_branch
-from nerf.refinement_multiround import _observe_silhouette
+from nerf.refinement_experiment import _select_views, _train_branch, _warmup_vertex_ema
+from nerf.refinement_multiround import _observe_silhouette, _region_stats
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256
 from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION, candidate_features, remap_vertex_ema, visibility_counts
+from nerf.refinement_attribution import edge_outcomes
 
 
 def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
@@ -27,7 +28,8 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
         options = config.get('options', {})
         policy.candidate_settings = {'fraction': options.get('refine_candidate_fraction', 0.5),
                                      'min_area': options.get('refine_min_face_area', 1e-12),
-                                     'ema_beta': options.get('refine_gradient_ema_beta', 0.9)}
+                                     'ema_beta': options.get('refine_gradient_ema_beta', 0.9),
+                                     'training_ema_warmup_steps': options.get('refine_gradient_ema_warmup_steps', 0)}
     try:
         policy.load_state_dict(trajectory['policy'])
     except RuntimeError as error:
@@ -125,10 +127,24 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     checkpoint_hash, mesh_hash = file_sha256(opt.ckpt), file_sha256(opt.mesh)
     policy = load_trajectory_policy(opt.refine_multibranch_policy, checkpoint_hash, mesh_hash)
     initial_policy = copy.deepcopy(policy.state_dict())
+    model = trainer.model
+    warmup_steps = getattr(opt, 'refine_gradient_ema_warmup_steps', 0)
+    warmup_beta = policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else getattr(opt, 'refine_gradient_ema_beta', 0.9)
+    warmup_state = {'ema': np.zeros(len(model.vertices), dtype=np.float64),
+                    'seen': np.zeros(len(model.vertices), dtype=bool)}
+    checkpoint_step = start_step
+    if isinstance(policy, CandidatePolicy) and warmup_steps != policy.candidate_settings['training_ema_warmup_steps']:
+        trainer.log('[INFO] evaluation EMA warmup differs from the policy training configuration')
+    opt.refine = False
+    ema_warmup = _warmup_vertex_ema(trainer, train_data, warmup_state, warmup_steps, warmup_beta, opt.seed)
+    if warmup_steps:
+        model_state = copy.deepcopy(model.state_dict())
+        old_vertices, old_triangles = model.vertices.clone(), model.triangles.clone()
+        old_v_cumsum, old_f_cumsum = model.v_cumsum.copy(), model.f_cumsum.copy()
+        scaler_state, start_step = copy.deepcopy(trainer.scaler.state_dict()), trainer.global_step
     initial = _observe_silhouette(trainer, val_data, evaluation_views)
     shapes = [item[4] for item in initial]
     initial_metrics = full_frame_metrics(initial, evaluation_views, shapes)
-    model = trainer.model
 
     def restore():
         model.vertices = old_vertices.clone()
@@ -161,6 +177,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
               'rgb_metric': 'RGB mean SmoothL1 on white background',
               'silhouette_metric': 'absolute antialiased raster alpha minus ground-truth alpha',
               'initial_faces': len(old_triangles), 'initial_global_step': start_step,
+              'checkpoint_global_step': checkpoint_step, 'ema_warmup': ema_warmup,
               'initial_metrics': initial_metrics, 'rounds': opt.refine_multibranch_rounds,
               'per_round_budget': opt.refine_face_budget, 'total_budget': total_budget,
               'optimization_steps': opt.refine_experiment_steps,
@@ -172,7 +189,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                    'pixel distance to a ground-truth alpha > 0.5 boundary over selection views')
     result['contour_radius_pixels'] = contour_radius
     result['rl_policy_feature_version'] = FEATURE_VERSION if isinstance(policy, CandidatePolicy) else 'legacy_three_features'
-    result['rl_vertex_ema_initialization'] = 'zeros on starting Stage 1 mesh; updated after each valid optimization step'
+    result['rl_vertex_ema_initialization'] = 'zeros on starting Stage 1 mesh followed by recorded warmup optimization steps'
     if isinstance(policy, CandidatePolicy):
         result['rl_selection'] = 'area-filtered candidates, sigmoid probability >= 0.5, descending score, then budget'
         result['rl_candidate_settings'] = policy.candidate_settings
@@ -182,8 +199,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     opt.refine = False
     for method, random_seed in branches:
         restore()
-        vertex_state = {'ema': np.zeros(len(model.vertices), dtype=np.float64),
-                        'seen': np.zeros(len(model.vertices), dtype=bool)}
+        vertex_state = {'ema': warmup_state['ema'].copy(), 'seen': warmup_state['seen'].copy()}
         branch = {'method': method, 'random_seed': random_seed,
                   'initial_faces': len(model.triangles), 'initial_global_step': trainer.global_step,
                   'initial_metrics': initial_metrics, 'rounds': []}
@@ -255,16 +271,22 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             executed = np.zeros(face_count, dtype=bool)
             executed[[edge['requester_face'] for edge in event['edge_events']]] = True
             observations_file = 'faces_{}_round_{:04d}.npz'.format(branch_name, round_index + 1)
+            _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
+                          vertex_state if method == 'rl' and isinstance(policy, CandidatePolicy) else None,
+                          policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
+            after_selection = _observe_silhouette(trainer, val_data, selection_views)
+            rgb_counts, rgb_before, rgb_after = _region_stats(observations, after_selection, face_count, 1)
+            sil_counts, sil_before, sil_after = _region_stats(observations, after_selection, face_count, 2, contour_radius)
+            outcomes = edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after,
+                                     sil_counts, sil_before, sil_after)
             np.savez_compressed(os.path.join(opt.refine_experiment_output, observations_file),
                                 face_id=np.arange(face_count), rgb_mean=means, visible_pixels=counts,
                                 area=areas, contour_near_pixels=near_counts,
                                 min_contour_distance_pixels=min_distance, status=status,
                                 passive=passive, executed_requester=executed, candidate=candidate_mask,
-                                candidate_features=candidate_feature_values,
-                                request_probability=request_probability)
-            _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
-                          vertex_state if method == 'rl' and isinstance(policy, CandidatePolicy) else None,
-                          policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
+                                candidate_features=candidate_feature_values, request_probability=request_probability,
+                                rgb_evaluation_pixels=rgb_counts, rgb_before=rgb_before, rgb_after=rgb_after,
+                                silhouette_evaluation_pixels=sil_counts, silhouette_before=sil_before, silhouette_after=sil_after)
             metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
                                          evaluation_views, shapes)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
@@ -281,6 +303,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                      'round_budget': round_budget, 'actual_added_faces': actual,
                                      'face_observations': observations_file, 'contour_views': contour_views,
                                      'candidate_info': candidate_info,
+                                     'edge_outcomes': outcomes,
                                      'cumulative_added_faces': cumulative, 'unfilled_budget': round_budget - actual,
                                      'training_indices': training_indices[round_index],
                                      'training_seed': training_seeds[round_index], 'event': event,

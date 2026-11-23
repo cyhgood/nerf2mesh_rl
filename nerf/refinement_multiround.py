@@ -9,10 +9,11 @@ import torch
 from torch import nn
 from scipy.ndimage import distance_transform_edt
 
-from nerf.refinement_experiment import _fixed_region_means, _observe, _select_views, _train_branch
+from nerf.refinement_experiment import _fixed_region_means, _observe, _select_views, _train_branch, _warmup_vertex_ema
 from nerf.refinement_rl import file_sha256
 from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candidate_features,
                                         remap_vertex_ema, visibility_counts)
+from nerf.refinement_attribution import edge_outcomes
 
 
 POLICY_OBJECTIVE = 'candidate_bernoulli_ema_v3'
@@ -227,6 +228,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     candidate_fraction = getattr(opt, 'refine_candidate_fraction', 0.5)
     min_area = getattr(opt, 'refine_min_face_area', 1e-12)
     ema_beta = getattr(opt, 'refine_gradient_ema_beta', 0.9)
+    warmup_steps = getattr(opt, 'refine_gradient_ema_warmup_steps', 0)
     if (not opt.refine_rl or opt.refine_compare_random or opt.refine_rl_eval or
             opt.refine_face_budget < 1 or opt.refine_multiround_rounds < 1 or horizon < 1 or opt.refine_rl_lr <= 0 or
             not 0 <= opt.refine_multiround_gamma <= 1):
@@ -239,7 +241,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     if (advantage_baseline not in ('none', 'mean') or advantage_scale not in ('none', 'std')
             or not np.isfinite(advantage_clip) or advantage_clip < 0):
         raise ValueError('Invalid advantage baseline, scale, or clip')
-    if not 0 < candidate_fraction <= 1 or not 0 <= ema_beta < 1 or not np.isfinite(min_area) or min_area < 0:
+    if (not 0 < candidate_fraction <= 1 or not 0 <= ema_beta < 1 or
+            not np.isfinite(min_area) or min_area < 0 or warmup_steps < 0):
         raise ValueError('Invalid candidate fraction, EMA decay or minimum area')
     reward_views = opt.refine_rl_reward_views or selection_views
     _select_views(len(val_data.poses), 1, selection_views, evaluation_views)
@@ -277,10 +280,16 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                     'seen': np.zeros(len(model.vertices), dtype=bool)}
     vertex_mapping = np.repeat(np.arange(len(model.vertices))[:, None], 2, axis=1)
     ema_initialization = 'zero_initial_mesh'
+    ema_warmup = None
     if opt.refine_multiround_resume:
         saved = torch.load(opt.refine_multiround_resume, map_location='cpu')
         old_config = dict(saved['config'])
         requested_config = dict(config)
+        old_options = dict(old_config.get('options', {}))
+        requested_options = dict(requested_config.get('options', {}))
+        if 'refine_gradient_ema_warmup_steps' not in old_options and warmup_steps == 0:
+            requested_options.pop('refine_gradient_ema_warmup_steps', None)
+        old_config['options'], requested_config['options'] = old_options, requested_options
         old_config.pop('rounds')
         requested_config.pop('rounds')
         old_horizon = old_config.pop('horizon', None)
@@ -348,11 +357,13 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                     or not np.isfinite(vertex_state['ema']).all()):
                 raise ValueError('Saved vertex EMA or mapping does not match the current mesh')
             ema_initialization = saved.get('ema_initialization', 'restored')
+            ema_warmup = saved.get('ema_warmup', {'method': 'legacy_checkpoint', 'steps': 0})
         else:
             vertex_state = {'ema': np.zeros(len(model.vertices), dtype=np.float64),
                             'seen': np.zeros(len(model.vertices), dtype=bool)}
             vertex_mapping = np.repeat(np.arange(len(model.vertices))[:, None], 2, axis=1)
             ema_initialization = 'legacy_mesh_zero_ema_and_reinitialized_policy'
+            ema_warmup = {'method': 'legacy_mesh_zero_reinitialize', 'steps': 0}
             trainer.log('[INFO] incompatible legacy policy: initialized new policy and zero vertex EMA')
         generator.set_state(saved['generator_state'])
         history = saved.get('history', [])
@@ -371,10 +382,14 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                  'policy': policy.state_dict(), 'policy_optimizer': optimizer.state_dict(),
                  'vertex_gradient_ema': vertex_state['ema'], 'vertex_gradient_seen': vertex_state['seen'],
                  'vertex_mapping': vertex_mapping, 'ema_initialization': ema_initialization,
+                 'ema_warmup': ema_warmup,
                  'generator_state': generator.get_state(), 'history': history, 'transitions': transitions}
         _save(os.path.join(opt.refine_experiment_output, 'trajectory.pt'), state)
 
     opt.refine = False
+    if not opt.refine_multiround_resume:
+        ema_warmup = _warmup_vertex_ema(trainer, train_data, vertex_state, warmup_steps, ema_beta, opt.seed)
+        ema_initialization = 'zero_initial_mesh_then_warmup' if warmup_steps else 'zero_initial_mesh'
     target_round = min(horizon, len(transitions) + opt.refine_multiround_rounds)
     for t in range(len(transitions), target_round):
         count = len(model.triangles)
@@ -417,6 +432,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         pixel_counts, rgb_before, rgb_after = _region_stats(before, after, count, 1)
         sil_counts, sil_before, sil_after = _region_stats(before, after, count, 2, radius)
         rewards = local_rewards(rgb_before, rgb_after, sil_before, sil_after, pixel_counts, costs, weights)
+        outcomes = edge_outcomes(event, count, pixel_counts, rgb_before, rgb_after,
+                                 sil_counts, sil_before, sil_after)
         child_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
         child_areas = _areas(child_vertices, model.triangles.cpu().numpy())
         _, eval_rgb_before, eval_rgb_after = _region_stats(evaluation_before, evaluation_after, count, 1)
@@ -441,6 +458,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                             'parent_face_id': parents, 'child_areas': child_areas, 'costs': costs,
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
                             'sil_before': sil_before, 'sil_after': sil_after, 'reward': rewards,
+                            'edge_outcomes': outcomes,
                             'evaluation': evaluation})
         snapshot(False)
         trainer.log('[INFO] multi-round {}: {} -> {} faces'.format(t + 1, count, len(model.triangles)))
@@ -468,13 +486,14 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'local_reward': _json_values(transition['reward']), 'lineage_return': None,
                       'reward_distributions': reward_distributions(transition, weights),
                       'reward_groups': grouped_rewards(transition, weights),
+                      'edge_outcomes': transition.get('edge_outcomes'),
                       'policy_loss': None, 'evaluation': transition['evaluation']}
             record.update(action_counts(transition))
             with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}_pending.json'.format(transition['round'])), 'w') as output:
                 json.dump(record, output, indent=2, allow_nan=False)
         with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
             json.dump(dict(config, segment_status='open', segment_rounds=len(transitions),
-                           ema_initialization=ema_initialization), output, indent=2)
+                           ema_initialization=ema_initialization, ema_warmup=ema_warmup), output, indent=2)
         trainer.log('[INFO] open return segment: {}/{} rounds; resume trajectory.pt'.format(len(transitions), horizon))
         return
 
@@ -500,6 +519,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'policy_loss': transition['policy_loss'],
                   'reward_distributions': reward_distributions(transition, weights, values),
                   'reward_groups': grouped_rewards(transition, weights, values),
+                  'edge_outcomes': transition.get('edge_outcomes'),
                   'advantage_stats': advantage_stats[t],
                   'missing_descendants': None if child_stats[t] is None else {
                       'missing_child_counts': child_stats[t]['missing_child_counts'].tolist(),
@@ -531,7 +551,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             json.dump(record, output, indent=2, allow_nan=False)
     snapshot(True)
     with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
-        json.dump(dict(config, segment_status='complete', ema_initialization=ema_initialization,
+        json.dump(dict(config, segment_status='complete', ema_initialization=ema_initialization, ema_warmup=ema_warmup,
                        segment_start_round=transitions[0]['round'],
                        segment_terminal_round=transitions[-1]['round']), output, indent=2, allow_nan=False)
     trainer.log('[INFO] multi-round trajectory saved to ' + opt.refine_experiment_output)
