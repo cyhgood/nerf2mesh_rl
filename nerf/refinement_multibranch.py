@@ -276,7 +276,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             executed = np.zeros(face_count, dtype=bool)
             executed[[edge['requester_face'] for edge in event['edge_events']]] = True
             observations_file = 'faces_{}_round_{:04d}.npz'.format(branch_name, round_index + 1)
-            _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
+            training_losses = _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
                           vertex_state if method == 'rl' and isinstance(policy, CandidatePolicy) else None,
                           policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
             after_selection = _observe_silhouette(trainer, val_data, selection_views)
@@ -317,6 +317,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                      'cumulative_added_faces': cumulative, 'unfilled_budget': round_budget - actual,
                                      'training_indices': training_indices[round_index],
                                      'training_seed': training_seeds[round_index], 'event': event,
+                                     'training_losses': training_losses,
                                      'metrics': metrics})
             _save_json(os.path.join(opt.refine_experiment_output, 'branch_{}.json'.format(branch_name)), branch)
             trainer.log('[INFO] {} seed {} round {}: {} added faces'.format(

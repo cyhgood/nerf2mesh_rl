@@ -83,6 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--wo_smooth', action='store_true', help="disable all smoothness regularizations")
     parser.add_argument('--lambda_lpips', type=float, default=0, help="loss scale")
     parser.add_argument('--lambda_offsets', type=float, default=0.1, help="loss scale")#顶点偏移L2正则化
+    parser.add_argument('--lambda_sil', type=float, default=0, help='Stage 1 full-image silhouette L1 loss weight')
     parser.add_argument('--lambda_lap', type=float, default=0.001, help="loss scale")#拉普拉斯平滑损失
     parser.add_argument('--lambda_normal', type=float, default=0, help="loss scale")#法向一致性损失
     parser.add_argument('--lambda_edgelen', type=float, default=0, help="loss scale")

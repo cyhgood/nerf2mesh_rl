@@ -926,7 +926,6 @@ class NeRFRenderer(nn.Module):#
         #五、保存最终结果
         results['depth'] = depth
         results['image'] = image
-
         return results
     
     # phase 2 mesh光栅化渲染
@@ -1082,6 +1081,9 @@ class NeRFRenderer(nn.Module):#
         #十三、返回结果
         results['depth'] = depth
         results['image'] = image
+        # T has passed through antialiasing and optional SSAA downsampling.
+        # Antialias supplies the position gradient; do not detach this tensor.
+        results['alpha'] = (1 - T).reshape(*prefix)
 
         # tmp: visualize accumulated triangle error by abusing depth
         # error_val = self.triangles_errors[trig_id.view(-1)].view(*prefix)

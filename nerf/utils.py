@@ -30,6 +30,7 @@ from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
 import lpips
+from nerf.silhouette_loss import stage1_silhouette_loss
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -628,6 +629,7 @@ class Trainer(object):
 
     def train_step(self, data):
 
+        self.loss_sil = None
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         index = data['index'] # [1/N]
@@ -722,6 +724,11 @@ class Trainer(object):
                     loss = loss + self.opt.lambda_specular * (specs ** 2).sum(-1).mean()
  
         if self.opt.stage == 1:
+            lambda_sil = getattr(self.opt, 'lambda_sil', 0.0)
+            if lambda_sil > 0:
+                loss_sil = stage1_silhouette_loss(outputs['alpha'], images, data)
+                self.loss_sil = loss_sil.detach()
+                loss = loss + lambda_sil * loss_sil
             # perceptual loss
             if self.opt.lambda_lpips > 0:
                 loss = loss + self.opt.lambda_lpips * self.criterion_lpips(pred_rgb.view(1, H, W, 3).permute(0,3,1,2).contiguous(), gt_rgb.view(1, H, W, 3).permute(0,3,1,2).contiguous())
@@ -1161,6 +1168,8 @@ class Trainer(object):
                         
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
+                    if self.loss_sil is not None:
+                        self.writer.add_scalar("train/loss_sil", self.loss_sil.item(), self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:

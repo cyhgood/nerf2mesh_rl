@@ -304,6 +304,13 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         requested_options = dict(requested_config.get('options', {}))
         if 'refine_gradient_ema_warmup_steps' not in old_options and warmup_steps == 0:
             requested_options.pop('refine_gradient_ema_warmup_steps', None)
+        # Older checkpoints predate silhouette supervision and used its zero default.
+        if saved['completed']:
+            # A new segment may intentionally use a different mesh loss.
+            old_options.pop('lambda_sil', None)
+            requested_options.pop('lambda_sil', None)
+        elif 'lambda_sil' not in old_options and requested_options.get('lambda_sil', 0) == 0:
+            requested_options.pop('lambda_sil', None)
         old_config['options'], requested_config['options'] = old_options, requested_options
         old_config.pop('rounds')
         requested_config.pop('rounds')
@@ -439,7 +446,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         global_round = len(history) + t
         step_seed = (opt.seed + global_round) % (2 ** 32)
         indices = np.random.RandomState(step_seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
-        _train_branch(trainer, train_data, indices, step_seed, vertex_state, ema_beta)
+        training_losses = _train_branch(trainer, train_data, indices, step_seed, vertex_state, ema_beta)
         after = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
         evaluation_after = _observe_silhouette(trainer, val_data, evaluation_views)
         pixel_counts, rgb_before, rgb_after = _region_stats(before, after, count, 1)
@@ -463,7 +470,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                           'sil_before': float(np.average(eval_sil_before[valid_eval_sil], weights=eval_sil_counts[valid_eval_sil])) if valid_eval_sil.any() else None,
                           'sil_after': float(np.average(eval_sil_after[valid_eval_sil], weights=eval_sil_counts[valid_eval_sil])) if valid_eval_sil.any() else None}
         transitions.append({'round': global_round + 1, 'faces_before': count, 'faces_after': len(model.triangles),
-                            'global_step': trainer.global_step, 'training_indices': indices, 'event': event,
+                            'global_step': trainer.global_step, 'training_indices': indices, 'training_losses': training_losses, 'event': event,
                             'visible': visible, 'features': decisions.features, 'feature_scales': np.asarray(feature_info['normalization_scales']),
                             'candidate_info': feature_info, 'vertex_mapping': vertex_mapping,
                             'actions': actions, 'probabilities': decisions.probabilities,
@@ -485,6 +492,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             record = {'round': transition['round'], 'segment_status': 'open',
                       'faces_before': transition['faces_before'], 'faces_after': transition['faces_after'],
                       'global_step': transition['global_step'], 'training_indices': transition['training_indices'],
+                      'training_losses': transition.get('training_losses'),
                       'visible_face_ids': transition['visible'].tolist(), 'actions': transition['actions'].tolist(),
                       'probabilities': _json_values(transition['probabilities']),
                       'decision_mask': transition['decision_mask'].tolist(),
@@ -533,7 +541,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         transition['advantage_stats'] = advantage_stats[t]
         record = {'round': transition['round'], 'faces_before': transition['faces_before'],
                   'faces_after': transition['faces_after'], 'global_step': transition['global_step'],
-                  'training_indices': transition['training_indices'], 'event': event,
+                  'training_indices': transition['training_indices'], 'training_losses': transition.get('training_losses'), 'event': event,
                   'executed_edges': len(event['executed_edges']), 'added_faces': event['added_faces'],
                   'policy_loss': transition['policy_loss'],
                   'reward_distributions': reward_distributions(transition, weights, values),
