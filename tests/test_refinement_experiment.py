@@ -9,10 +9,38 @@ import numpy as np
 import torch
 
 from meshutils import subdivide_longest_edges
-from nerf.refinement_experiment import _child_observations, _fixed_region_means, run_refinement_experiment
+from nerf.refinement_experiment import (
+    _child_observations, _fixed_region_means, _foreground_errors, _select_views,
+    run_refinement_experiment,
+)
 
 
 class RefinementExperimentTest(unittest.TestCase):
+    def test_view_selection_and_overlap(self):
+        self.assertEqual(_select_views(10, 2), ([0, 1], [2, 3]))
+        self.assertEqual(_select_views(5, 2, [3, 1], [4, 0]), ([3, 1], [4, 0]))
+        for args in ((3, 2, None, None), (5, 2, [1], [1]),
+                     (5, 2, [1, 1], [2]), (5, 2, [5], [2]),
+                     (5, 2, [1], None)):
+            with self.assertRaises(ValueError):
+                _select_views(*args)
+        self.assertEqual(_select_views(2, 1, [1], [1], True), ([1], [1]))
+
+    def test_foreground_weighted_aggregate(self):
+        before = [(np.array([0, -1, 0]), np.array([1., 3., 9.]), np.array([True, True, False])),
+                  (np.array([1, -1]), np.array([8., 4.]), np.array([False, True]))]
+        refined = [(np.array([-1, -1, 0]), np.array([2., 4., 0.]), None),
+                   (np.array([1, -1]), np.array([0., 1.]), None)]
+        control = [(np.array([0, 0, 0]), np.array([3., 5., 0.]), None),
+                   (np.array([1, -1]), np.array([0., 2.]), None)]
+        rows, overall = _foreground_errors(before, refined, control, [4, 5])
+        self.assertEqual(rows[0]['foreground_pixels'], 2)
+        self.assertEqual(rows[0]['before_error'], 2.)
+        self.assertEqual(overall['foreground_pixels'], 3)
+        self.assertAlmostEqual(overall['before_error'], 8. / 3)
+        self.assertAlmostEqual(overall['refined_error'], 7. / 3)
+        self.assertAlmostEqual(overall['control_error'], 10. / 3)
+
     def test_fixed_regions_include_pixels_that_leave_the_mesh(self):
         before = [(np.array([0, 0, 1, -1]), np.array([2., 4., 3., 9.]))]
         after = [(np.array([-1, 2, 3, 0]), np.array([10., 1., 2., 0.]))]
@@ -63,8 +91,10 @@ class RefinementExperimentTest(unittest.TestCase):
             opt = SimpleNamespace(stage=1, refine_mode='local', refine=True, bound=1,
                                   ind_dim=0, gui=False, refine_experiment_steps=2,
                                   refine_experiment_views=2, refine_experiment_output=output,
+                                  refine_selection_views=[0], refine_evaluation_views=[1],
                                   ckpt=ckpt, mesh=mesh, seed=42)
             samples = []
+            observed_views = []
             trainer = SimpleNamespace(opt=opt, model=model, device=torch.device('cpu'),
                                       global_step=7, scaler=torch.cuda.amp.GradScaler(enabled=False),
                                       criterion=torch.nn.SmoothL1Loss(reduction='none'))
@@ -74,6 +104,7 @@ class RefinementExperimentTest(unittest.TestCase):
             trainer.log = lambda message: None
 
             def eval_step(data):
+                observed_views.append(data)
                 count = len(model.triangles)
                 model.triangles_errors_id = torch.tensor([0, 1 if count == 2 else 2, -1])
                 prediction = torch.full((3, 3), float(model.color.detach()))
@@ -87,10 +118,15 @@ class RefinementExperimentTest(unittest.TestCase):
             trainer.train_step = train_step
             run_refinement_experiment(trainer, Dataset(), Dataset())
             self.assertEqual(samples[:2], samples[2:])
+            self.assertEqual(observed_views, [0, 1, 1, 1])
             with open(os.path.join(output, 'event.json')) as file:
                 event = json.load(file)
             self.assertEqual(event['parent_face_id'], [0, 0, 1, 1])
             self.assertEqual(event['passive_faces'], [1])
+            self.assertEqual(event['selection_views'], [0])
+            self.assertEqual(event['evaluation_views'], [1])
+            self.assertEqual(event['largest_evaluation_face']['evaluation_pixels'], 1)
+            self.assertEqual(event['foreground_errors_overall']['foreground_pixels'], 2)
             with open(os.path.join(output, 'faces.csv')) as file:
                 rows = list(csv.DictReader(file))
             self.assertEqual(len(rows), 2)
