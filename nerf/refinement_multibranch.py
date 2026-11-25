@@ -12,10 +12,20 @@ from scipy.ndimage import binary_erosion, distance_transform_edt
 from nerf.refinement_experiment import _select_views, _train_branch, _warmup_vertex_ema
 from nerf.refinement_multiround import _observe_silhouette, _region_stats, edge_costs, local_rewards
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256
-from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, SequentialFaceDecisions,
+from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, SequentialFaceDecisions, RankedFaceDecisions,
                                         candidate_features, remap_vertex_ema, visibility_counts)
 from nerf.refinement_attribution import edge_outcomes
 from nerf.refinement_gnn import SparseFacePolicy, POLICY_VERSION, policy_graph_state
+
+
+def probability_distribution(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return {'count': 0, 'min': None, 'p25': None, 'median': None, 'p75': None, 'max': None, 'mean': None}
+    return {'count': len(values), **dict(zip(('min', 'p25', 'median', 'p75', 'max'),
+                                             np.quantile(values, [0, .25, .5, .75, 1]).tolist())),
+            'mean': float(values.mean())}
 
 
 def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
@@ -124,6 +134,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                     old_f_cumsum, scaler_state, start_step):
     opt = trainer.opt
     contour_radius = getattr(opt, 'refine_silhouette_radius', 8.0)
+    policy_mode = getattr(opt, 'refine_multibranch_policy_mode', 'threshold')
+    if policy_mode not in ('threshold', 'rank'):
+        raise ValueError('Unknown multi-branch policy evaluation mode')
     if opt.refine_multiround or opt.refine_rl or opt.refine_compare_random or opt.refine_rl_eval:
         raise ValueError('Multi-branch evaluation must be used without other experiment modes')
     if opt.refine_multibranch_rounds < 1 or opt.refine_face_budget < 1:
@@ -141,6 +154,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     _select_views(len(val_data.poses), 1, selection_views, evaluation_views)
     checkpoint_hash, mesh_hash = file_sha256(opt.ckpt), file_sha256(opt.mesh)
     policy = load_trajectory_policy(opt.refine_multibranch_policy, checkpoint_hash, mesh_hash)
+    if policy_mode == 'rank' and not isinstance(policy, CandidatePolicy):
+        raise ValueError('Budget ranking requires a current MLP or GNN candidate policy checkpoint')
     primary_policy = policy
     comparison_path = getattr(opt, 'refine_multibranch_compare_policy', '')
     comparison_policy = load_trajectory_policy(comparison_path, checkpoint_hash, mesh_hash) if comparison_path else None
@@ -214,6 +229,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                                   getattr(opt, 'refine_multiround_face_cost', 0.001)],
               'selection_region_reward_note': 'local reward on pre-split selection-view regions; no policy updates or lineage return in evaluation',
               'training_indices': training_indices, 'training_seeds': training_seeds,
+              'policy_evaluation_mode': policy_mode,
               'rl_selection': 'descending shared policy score among visible faces',
               'high_error_selection': 'descending average RGB error among visible faces',
               'random_selection': 'seeded permutation of visible faces', 'branches': []}
@@ -226,7 +242,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     result['rl_policy_feature_version'] = FEATURE_VERSION if isinstance(policy, CandidatePolicy) else 'legacy_three_features'
     result['rl_vertex_ema_initialization'] = 'zeros on starting Stage 1 mesh followed by recorded warmup optimization steps'
     if isinstance(policy, CandidatePolicy):
-        result['rl_selection'] = 'area order; sequential sigmoid threshold decisions using current remaining budget'
+        result['rl_selection'] = ('highest current probability; rescore all untried candidates when budget changes; always request'
+                                  if policy_mode == 'rank' else
+                                  'area order; sequential sigmoid >= 0.5 decisions using current remaining budget')
         result['rl_candidate_settings'] = policy.candidate_settings
         result['rl_training_objective'] = policy.training_objective
 
@@ -239,6 +257,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         restore()
         vertex_state = {'ema': warmup_state['ema'].copy(), 'seen': warmup_state['seen'].copy()}
         branch = {'method': method, 'random_seed': random_seed,
+                  'policy_evaluation_mode': (policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
                   'policy_type': ('gnn' if isinstance(policy, SparseFacePolicy) else 'mlp') if is_rl else None,
                   'policy_training_reward_weights': getattr(policy, 'training_reward_weights', None) if is_rl else None,
                   'initial_faces': len(model.triangles), 'initial_global_step': trainer.global_step,
@@ -262,6 +281,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             candidate_mask = np.zeros(face_count, dtype=bool)
             candidate_feature_values = np.full((face_count, 9), np.nan, dtype=np.float32)
             request_probability = np.full(face_count, np.nan, dtype=np.float32)
+            initial_probability = np.full(face_count, np.nan, dtype=np.float32)
             round_budget = min(opt.refine_face_budget, total_budget - cumulative)
             if is_rl and (len(visible) or isinstance(policy, CandidatePolicy)):
                 if isinstance(policy, CandidatePolicy):
@@ -288,7 +308,12 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                             vertex_state['ema'], vertex_state['seen'], 1.0 if round_budget else 0.0,
                             policy.candidate_settings['fraction'], policy.candidate_settings['min_area'])
                     candidate_mask[visible] = True
-                    decisions = SequentialFaceDecisions(policy, visible, features, round_budget, deterministic=True, graph=graph_state)
+                    if policy_mode == 'rank':
+                        decisions = RankedFaceDecisions(policy, visible, features, round_budget, graph=graph_state)
+                        initial_probability[visible] = decisions.initial_probabilities
+                    else:
+                        decisions = SequentialFaceDecisions(policy, visible, features, round_budget, deterministic=True, graph=graph_state)
+                        initial_probability[visible] = decisions.score_all(round_budget)
                     order = visible
                 else:
                     visible, features, _ = face_features(vertices, faces, sums, counts)
@@ -324,7 +349,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             status[counts > 0] = 'not_candidate' if is_rl and isinstance(policy, CandidatePolicy) else 'budget_not_considered'
             status[visible] = 'hold' if is_rl and isinstance(policy, CandidatePolicy) else 'budget_not_considered'
             status[order] = 'budget_not_considered'
-            for face in order[:event['considered_count']]:
+            considered_faces = event.get('considered_faces', order[:event['considered_count']])
+            for face in considered_faces:
                 status[face] = event['request_status'][int(face)]
             passive = np.zeros(face_count, dtype=bool)
             passive[event['passive_faces']] = True
@@ -358,6 +384,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                 min_contour_distance_pixels=min_distance, status=status,
                                 passive=passive, executed_requester=executed, candidate=candidate_mask,
                                 candidate_features=candidate_feature_values, request_probability=request_probability,
+                                initial_probability=initial_probability,
+                                decision_order=np.asarray(considered_faces, dtype=np.int64),
                                 decision_mask=decisions.decided if decisions is not None else np.array([], dtype=bool),
                                 decision_face_ids=visible if decisions is not None else np.array([], dtype=np.int64),
                                 remaining_budget=decisions.remaining if decisions is not None else np.array([], dtype=np.int64),
@@ -368,15 +396,22 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
                                          evaluation_views, shapes)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
+                                     'policy_evaluation_mode': (policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
+                                     'initial_candidate_probability_distribution': probability_distribution(initial_probability) if decisions is not None else None,
+                                     'attempted_probability_distribution': probability_distribution(decisions.probabilities[decisions.decided]) if decisions is not None else None,
                                      'faces_after': len(model.triangles), 'visible_candidates': len(visible),
+                                     'considered_count': event['considered_count'],
                                      'requested_count': int(np.count_nonzero(decisions.actions)) if decisions is not None else len(order),
                                      'hold_count': int(np.count_nonzero(decisions.decided & ~decisions.actions)) if decisions is not None else len(visible) - len(order),
                                      'executed_request_count': sum(
                                          event['request_status'][int(face)] == 'executed'
-                                         for face in order[:event['considered_count']]),
+                                         for face in considered_faces),
                                      'conflict_count': sum(
                                          event['request_status'][int(face)] == 'conflict'
-                                         for face in order[:event['considered_count']]),
+                                         for face in considered_faces),
+                                     'already_split_count': sum(event['request_status'][int(face)] == 'already_split' for face in considered_faces),
+                                     'budget_rejected_count': sum(event['request_status'][int(face)] == 'budget' for face in considered_faces),
+                                     'budget_not_considered_count': sum(event['request_status'][int(face)] == 'budget_not_considered' for face in order),
                                      'budget_unexecuted_count': sum(
                                          event['request_status'][int(face)] in ('budget', 'budget_not_considered') for face in order),
                                      'round_budget': round_budget, 'actual_added_faces': actual,

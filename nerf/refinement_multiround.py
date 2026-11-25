@@ -319,6 +319,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         old_options = dict(old_config.get('options', {}))
         requested_options = dict(requested_config.get('options', {}))
         # Graph recording does not change the policy or the optimization trajectory.
+        for key in ('refine_multibranch_policy_mode',):
+            old_options.pop(key, None)
+            requested_options.pop(key, None)
         for key in (('refine_observation_graph',) if policy_type == 'gnn' else ('refine_observation_graph', 'refine_graph_self_loops')):
             old_options.pop(key, None)
             requested_options.pop(key, None)

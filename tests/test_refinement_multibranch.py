@@ -211,6 +211,44 @@ class MultiBranchTest(unittest.TestCase):
                 self.assertLessEqual(first['round_budget'], paired['per_round_budget'])
                 self.assertLessEqual(second['round_budget'], paired['per_round_budget'])
                 self.assertLessEqual(second['actual_added_faces'], second['round_budget'])
+            low_mlp = CandidatePolicy()
+            low_gnn = SparseFacePolicy()
+            with torch.no_grad():
+                for p in low_mlp.parameters():
+                    p.zero_()
+                low_mlp.network[-1].bias.fill_(-4.)
+                for p in low_gnn.parameters():
+                    p.zero_()
+                low_gnn.action[-1].bias.fill_(-4.)
+            common = {'checkpoint_sha256': file_sha256(checkpoint), 'mesh_sha256': file_sha256(mesh),
+                      'feature_version': FEATURE_VERSION}
+            torch.save({'policy': low_mlp.state_dict(), 'config': common}, policy_path)
+            torch.save({'policy': low_gnn.state_dict(), 'config': dict(common, policy_type='gnn',
+                                                                       policy_architecture=POLICY_VERSION)}, gnn_path)
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 10
+            opt.refine = True
+            opt.refine_multibranch_policy_mode = 'rank'
+            opt.refine_experiment_output = os.path.join(directory, 'rank_compare')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                ranked = json.load(source)
+            self.assertEqual(ranked['policy_evaluation_mode'], 'rank')
+            for branch in ranked['branches'][:2]:
+                first = branch['rounds'][0]
+                self.assertEqual(first['policy_evaluation_mode'], 'rank')
+                self.assertLess(first['initial_candidate_probability_distribution']['max'], .5)
+                self.assertGreater(first['actual_added_faces'], 0)
+                self.assertGreater(first['requested_count'], 0)
+                self.assertGreater(first['executed_request_count'], 0)
+                with np.load(os.path.join(opt.refine_experiment_output, first['face_observations'])) as saved:
+                    self.assertEqual(len(saved['decision_order']), first['requested_count'])
+                    self.assertTrue(np.isnan(saved['decision_log_probability']).all())
+            opt.refine_multibranch_policy_mode = 'threshold'
             opt.refine_multibranch_compare_policy = ''
 
             model = Model()

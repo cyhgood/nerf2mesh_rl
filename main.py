@@ -152,6 +152,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_multibranch_eval', action='store_true', help='compare RL, high-error and random over consecutive refinement rounds')
     parser.add_argument('--refine_multibranch_policy', type=str, default='', help='multi-round trajectory.pt containing the fixed RL policy')
     parser.add_argument('--refine_multibranch_compare_policy', type=str, default='', help='optional second MLP/GNN trajectory for matched policy comparison')
+    parser.add_argument('--refine_multibranch_policy_mode', choices=['threshold', 'rank'], default='threshold', help='threshold at 0.5 or rank candidates with current remaining budget')
     parser.add_argument('--refine_multibranch_rounds', type=int, default=3, help='number of consecutive evaluation rounds')
     parser.add_argument('--refine_multibranch_total_budget', type=int, default=0, help='maximum total added faces; 0 means rounds times per-round budget')
     parser.add_argument('--refine_experiment_output', type=str, default='', help='output directory for the refinement experiment')

@@ -59,6 +59,21 @@ class SequentialFaceDecisions:
             with torch.no_grad():
                 self.embeddings = policy.encode(graph)[self.candidate_nodes]
 
+    def score_all(self, remaining):
+        """Probability of every candidate at one common budget; does not decide."""
+        fraction = remaining / self.budget if self.budget else 0.0
+        with torch.no_grad():
+            if self.graph is not None:
+                logits = self.policy.score(self.embeddings, np.full(len(self.features), fraction, dtype=np.float32))
+            else:
+                features = self.features.copy()
+                features[:, 6] = fraction
+                logits = self.policy(torch.from_numpy(features))
+            probabilities = torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+        if probabilities.shape != (len(self.features),) or not np.isfinite(probabilities).all():
+            raise ValueError('Policy produced invalid candidate probabilities')
+        return probabilities
+
     def __call__(self, face_id, remaining):
         index = self.positions[face_id]
         self.features[index, 6] = remaining / self.budget if self.budget else 0.0
@@ -75,6 +90,48 @@ class SequentialFaceDecisions:
         self.log_probabilities[index] = float(log_probability)
         self.remaining[index] = remaining
         return action
+
+
+class RankedFaceDecisions(SequentialFaceDecisions):
+    """Evaluation only: request the highest current probability until budget runs out."""
+    def __init__(self, policy, candidates, features, budget, graph=None):
+        super().__init__(policy, candidates, features, budget, deterministic=True, graph=graph)
+        self.candidates = np.asarray(candidates, dtype=np.int64)
+        self.initial_probabilities = self.score_all(budget)
+        self._budget = None
+        self._ordered = np.empty(0, dtype=np.int64)
+        self._offset = 0
+        self._scores = None
+        self.decision_order = []
+
+    def next_candidate(self, remaining):
+        if remaining <= 0:
+            raise ValueError('Cannot select a ranked candidate with zero budget')
+        if remaining != self._budget:
+            self._scores = self.score_all(remaining)
+            indices = np.flatnonzero(~self.decided)
+            self._ordered = indices[np.lexsort((self.candidates[indices], -self._scores[indices]))]
+            self._budget, self._offset = remaining, 0
+        while self._offset < len(self._ordered) and self.decided[self._ordered[self._offset]]:
+            self._offset += 1
+        if self._offset >= len(self._ordered):
+            raise ValueError('Ranked candidate set is exhausted')
+        index = self._ordered[self._offset]
+        self._offset += 1
+        return int(self.candidates[index])
+
+    def __call__(self, face_id, remaining):
+        index = self.positions[face_id]
+        if self._budget != remaining or self.decided[index]:
+            raise ValueError('Ranked decision does not match the current budget or candidate state')
+        self.features[index, 6] = remaining / self.budget
+        self.actions[index] = True
+        self.decided[index] = True
+        self.probabilities[index] = self._scores[index]
+        self.remaining[index] = remaining
+        self.decision_order.append(int(face_id))
+        # Ranking is deterministic and is not a Bernoulli policy sample.
+        return True
 
 
 def visibility_counts(observations, face_count):

@@ -228,15 +228,27 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     added_faces = 0
     additions = []
     considered_count = 0
+    considered_faces = []
+    ranked = decision_fn is not None and hasattr(decision_fn, 'next_candidate')
+    candidate_set = set(map(int, candidate_order)) if ranked else None
+    considered_set = set() if ranked else None
     for face_id in candidate_order:
         if max_added_faces is not None and added_faces >= max_added_faces:
+            if ranked:
+                break
             if decision_fn is None:
                 processed.append(int(face_id))
                 request_status[int(face_id)] = 'budget'
             else:
                 request_status[int(face_id)] = 'budget_not_considered'
             continue
+        if ranked:
+            face_id = decision_fn.next_candidate(max_added_faces - added_faces)
+            if face_id not in candidate_set or face_id in considered_set:
+                raise ValueError('Ranked selector returned an invalid or repeated face')
+            considered_set.add(int(face_id))
         considered_count += 1
+        considered_faces.append(int(face_id))
         if decision_fn is not None and not decision_fn(int(face_id), max_added_faces - added_faces):
             request_status[int(face_id)] = 'hold'
             continue
@@ -273,6 +285,11 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
         for index in incident_faces:
             split_faces[index] = (edge, midpoint_id)
 
+    if ranked:
+        for face_id in candidate_order:
+            if int(face_id) not in considered_set:
+                request_status[int(face_id)] = 'budget_not_considered'
+
     new_faces = []
     parent_face_id = []
     for face_id, face in enumerate(faces):
@@ -300,6 +317,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
                           'edge_events': edge_events,
                           'passive_faces': passive, 'added_faces': added_faces,
                           'considered_count': considered_count,
+                          'considered_faces': considered_faces,
                           'cumulative_added_faces': additions},)
     return result
 
