@@ -123,6 +123,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_face_budget', type=int, default=0, help='maximum actual added faces for each comparison branch')
     parser.add_argument('--refine_random_seeds', type=int, nargs='+', default=[0], help='random selection seeds for repeated comparisons')
     parser.add_argument('--refine_rl', action='store_true', help='run the Stage 1 policy-gradient refinement experiment')
+    parser.add_argument('--refine_policy', choices=['mlp', 'gnn'], default='mlp', help='multi-round shared policy architecture')
     parser.add_argument('--refine_rl_rounds', type=int, default=1, help='policy sampling and update rounds')
     parser.add_argument('--refine_rl_reward_views', type=int, nargs='+', default=None, help='validation view indices for training rewards; defaults to selection views')
     parser.add_argument('--refine_rl_lr', type=float, default=0.001, help='policy optimizer learning rate')
@@ -150,6 +151,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_multiround_resume', type=str, default='', help='resume trajectory checkpoint')
     parser.add_argument('--refine_multibranch_eval', action='store_true', help='compare RL, high-error and random over consecutive refinement rounds')
     parser.add_argument('--refine_multibranch_policy', type=str, default='', help='multi-round trajectory.pt containing the fixed RL policy')
+    parser.add_argument('--refine_multibranch_compare_policy', type=str, default='', help='optional second MLP/GNN trajectory for matched policy comparison')
     parser.add_argument('--refine_multibranch_rounds', type=int, default=3, help='number of consecutive evaluation rounds')
     parser.add_argument('--refine_multibranch_total_budget', type=int, default=0, help='maximum total added faces; 0 means rounds times per-round budget')
     parser.add_argument('--refine_experiment_output', type=str, default='', help='output directory for the refinement experiment')
@@ -173,6 +175,8 @@ if __name__ == '__main__':
         parser.error('--lambda_stage1_depth must be finite and nonnegative')
     if opt.lambda_stage1_depth > 0 and (opt.stage != 1 or not opt.stage1_depth_manifest):
         parser.error('Stage 1 depth requires --stage 1 and --stage1_depth_manifest')
+    if opt.refine_policy == 'gnn' and not opt.refine_multiround:
+        parser.error('--refine_policy gnn requires --refine_multiround; evaluation loads the policy type from its checkpoint')
 
     opt.cuda_ray = True
 

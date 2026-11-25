@@ -13,6 +13,7 @@ from nerf.refinement_multibranch import (full_frame_metrics, load_trajectory_pol
                                          selection_face_observations)
 from nerf.refinement_rl import FacePolicy, file_sha256
 from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION
+from nerf.refinement_gnn import SparseFacePolicy, POLICY_VERSION
 
 
 class MultiBranchTest(unittest.TestCase):
@@ -187,6 +188,30 @@ class MultiBranchTest(unittest.TestCase):
                 self.assertIn('rgb_before', saved.files)
                 self.assertIn('silhouette_after', saved.files)
             self.assertIn('edge_outcomes', rl['rounds'][0])
+
+            gnn_path = os.path.join(directory, 'gnn.pt')
+            torch.save({'policy': SparseFacePolicy().state_dict(), 'config': {
+                'checkpoint_sha256': file_sha256(checkpoint), 'mesh_sha256': file_sha256(mesh),
+                'feature_version': FEATURE_VERSION, 'policy_type': 'gnn', 'policy_architecture': POLICY_VERSION}}, gnn_path)
+            model = Model()
+            trainer.model = model
+            trainer.global_step = 10
+            opt.refine = True
+            opt.refine_multibranch_compare_policy = gnn_path
+            opt.refine_experiment_output = os.path.join(directory, 'compare_gnn')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                paired = json.load(source)
+            self.assertEqual([branch['policy_type'] for branch in paired['branches'][:2]], ['mlp', 'gnn'])
+            for first, second in zip(paired['branches'][0]['rounds'], paired['branches'][1]['rounds']):
+                self.assertEqual(first['training_indices'], second['training_indices'])
+                self.assertLessEqual(first['round_budget'], paired['per_round_budget'])
+                self.assertLessEqual(second['round_budget'], paired['per_round_budget'])
+                self.assertLessEqual(second['actual_added_faces'], second['round_budget'])
+            opt.refine_multibranch_compare_policy = ''
 
             model = Model()
             trainer.model = model

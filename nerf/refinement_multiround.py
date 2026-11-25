@@ -14,6 +14,7 @@ from nerf.refinement_rl import file_sha256
 from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candidate_features,
                                         remap_vertex_ema, visibility_counts, SequentialFaceDecisions)
 from nerf.refinement_attribution import edge_outcomes
+from nerf.refinement_gnn import SparseFacePolicy, POLICY_VERSION, policy_graph_state
 
 
 POLICY_OBJECTIVE = 'candidate_sequential_budget_stop_v5'
@@ -91,7 +92,8 @@ def face_policy_losses(policy, transitions, returns, baseline='none', scale='non
             losses.append(None)
             stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
             continue
-        logits = policy(torch.from_numpy(transition['features']))
+        logits = (policy.logits(transition['policy_graph'], visible, transition['features'][:, 6])
+                  if isinstance(policy, SparseFacePolicy) else policy(torch.from_numpy(transition['features'])))
         sampled = torch.from_numpy(transition['actions'].astype(np.float32))
         log_probabilities = -torch.nn.functional.binary_cross_entropy_with_logits(logits, sampled, reduction='none')
         mask = torch.from_numpy(valid)
@@ -263,6 +265,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     if (not reward_views or len(reward_views) != len(set(reward_views)) or
             any(view < 0 or view >= len(train_data.poses) for view in reward_views)):
         raise ValueError('Reward views must be unique indices in the training dataset')
+    policy_type = getattr(opt, 'refine_policy', 'mlp')
+    if policy_type not in ('mlp', 'gnn'):
+        raise ValueError('Unknown Stage 1 policy type')
     config = {'checkpoint': os.path.abspath(opt.ckpt), 'mesh': os.path.abspath(opt.mesh),
               'checkpoint_sha256': file_sha256(opt.ckpt), 'mesh_sha256': file_sha256(opt.mesh),
               'selection_views': selection_views, 'reward_views': reward_views,
@@ -278,17 +283,19 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'policy_objective': POLICY_OBJECTIVE,
               'budget_decision_mode': 'area order, sequential remaining/per-round budget, stop sampling at zero',
               'feature_version': FEATURE_VERSION,
+              'policy_type': policy_type,
+              'policy_architecture': POLICY_VERSION if policy_type == 'gnn' else 'candidate_mlp_v1',
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
               'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
-                        'refine_multiround_horizon', 'refine_silhouette_radius'}
+                        'refine_multiround_horizon', 'refine_silhouette_radius', 'refine_multibranch_compare_policy'}
     config['options'] = {key: value for key, value in vars(opt).items() if key not in excluded_options}
     if getattr(opt, 'lambda_stage1_depth', 0) > 0:
         from nerf.stage1_depth import Stage1DepthSource
         config['stage1_depth_source'] = Stage1DepthSource(opt.stage1_depth_manifest).describe()
     model = trainer.model
     torch.manual_seed(opt.seed)
-    policy = CandidatePolicy()
+    policy = SparseFacePolicy() if policy_type == 'gnn' else CandidatePolicy()
     optimizer = torch.optim.Adam(policy.parameters(), lr=opt.refine_rl_lr)
     generator = torch.Generator().manual_seed(opt.seed)
     transitions = []
@@ -303,12 +310,20 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         saved = torch.load(opt.refine_multiround_resume, map_location='cpu')
         old_config = dict(saved['config'])
         requested_config = dict(config)
+        old_policy_type = old_config.pop('policy_type', 'mlp')
+        requested_config.pop('policy_type')
+        old_architecture = old_config.pop('policy_architecture', 'candidate_mlp_v1')
+        requested_architecture = requested_config.pop('policy_architecture')
+        if old_policy_type != policy_type or old_architecture != requested_architecture:
+            raise ValueError('Policy architecture mismatch: checkpoint is {}, requested {}'.format(old_policy_type, policy_type))
         old_options = dict(old_config.get('options', {}))
         requested_options = dict(requested_config.get('options', {}))
         # Graph recording does not change the policy or the optimization trajectory.
-        for key in ('refine_observation_graph', 'refine_graph_self_loops'):
+        for key in (('refine_observation_graph',) if policy_type == 'gnn' else ('refine_observation_graph', 'refine_graph_self_loops')):
             old_options.pop(key, None)
             requested_options.pop(key, None)
+        if 'refine_policy' not in old_options and policy_type == 'mlp':
+            requested_options.pop('refine_policy', None)
         if 'refine_gradient_ema_warmup_steps' not in old_options and warmup_steps == 0:
             requested_options.pop('refine_gradient_ema_warmup_steps', None)
         # Older checkpoints predate silhouette supervision and used its zero default.
@@ -444,23 +459,28 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         model.triangles_errors_cnt = torch.tensor(observations, dtype=torch.float32, device=trainer.device)
         current_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
         graph_files = None
-        if getattr(opt, 'refine_observation_graph', False):
+        graph_state = None
+        if getattr(opt, 'refine_observation_graph', False) or policy_type == 'gnn':
             from nerf.refinement_graph import build_face_graph, save_face_graph
             graph, visible, features, feature_info = build_face_graph(
                 current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
                 len(selection_views), vertex_state['ema'], vertex_state['seen'],
                 opt.refine_face_budget, opt.refine_face_budget, candidate_fraction, min_area,
                 getattr(opt, 'refine_graph_self_loops', False))
-            graph_files = {phase: os.path.abspath(os.path.join(opt.refine_experiment_output,
-                            'graph_round_{:04d}_{}.npz'.format(len(history) + t + 1, phase)))
-                           for phase in ('before', 'after')}
-            save_face_graph(graph_files['before'], graph)
+            if policy_type == 'gnn':
+                graph_state = policy_graph_state(graph)
+            if getattr(opt, 'refine_observation_graph', False):
+                graph['metadata']['policy'] = 'shared ' + policy_type + ' policy'
+                graph_files = {phase: os.path.abspath(os.path.join(opt.refine_experiment_output,
+                                'graph_round_{:04d}_{}.npz'.format(len(history) + t + 1, phase)))
+                               for phase in ('before', 'after')}
+                save_face_graph(graph_files['before'], graph)
         else:
             visible, features, feature_info = candidate_features(
                 current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
                 len(selection_views), vertex_state['ema'], vertex_state['seen'], 1.0,
                 candidate_fraction, min_area)
-        decisions = SequentialFaceDecisions(policy, visible, features, opt.refine_face_budget, generator=generator)
+        decisions = SequentialFaceDecisions(policy, visible, features, opt.refine_face_budget, generator=generator, graph=graph_state)
         model.refine_and_decimate(export_mesh=False, candidate_order=visible,
                                   max_added_faces=opt.refine_face_budget, decision_fn=decisions)
         event = copy.deepcopy(model.refinement_event)
@@ -484,6 +504,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                 updated_sums, updated_pixels, updated_views, len(selection_views), vertex_state['ema'],
                 vertex_state['seen'], opt.refine_face_budget - event['added_faces'], opt.refine_face_budget,
                 candidate_fraction, min_area, getattr(opt, 'refine_graph_self_loops', False))
+            updated_graph['metadata']['policy'] = 'shared ' + policy_type + ' policy'
             save_face_graph(graph_files['after'], updated_graph, parents)
         after = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
         evaluation_after = _observe_silhouette(trainer, val_data, evaluation_views)
@@ -511,6 +532,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                             'global_step': trainer.global_step, 'training_indices': indices, 'training_losses': training_losses, 'event': event,
                             'visible': visible, 'features': decisions.features, 'feature_scales': np.asarray(feature_info['normalization_scales']),
                             'candidate_info': feature_info, 'vertex_mapping': vertex_mapping, 'observation_graphs': graph_files,
+                            'policy_graph': graph_state,
                             'actions': actions, 'probabilities': decisions.probabilities,
                             'decision_mask': decisions.decided, 'decision_log_probabilities': decisions.log_probabilities,
                             'decision_order': visible[decisions.decided].copy(), 'round_budget': opt.refine_face_budget,

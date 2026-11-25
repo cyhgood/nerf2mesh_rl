@@ -34,7 +34,7 @@ class CandidatePolicy(nn.Module):
 
 class SequentialFaceDecisions:
     """Record exactly the state and Bernoulli action used before each edge attempt."""
-    def __init__(self, policy, candidates, features, budget, generator=None, deterministic=False):
+    def __init__(self, policy, candidates, features, budget, generator=None, deterministic=False, graph=None):
         self.policy = policy
         self.positions = {int(face): index for index, face in enumerate(candidates)}
         self.features = features.copy()
@@ -46,12 +46,25 @@ class SequentialFaceDecisions:
         self.probabilities = np.full(len(candidates), np.nan)
         self.log_probabilities = np.full(len(candidates), np.nan)
         self.remaining = np.full(len(candidates), -1, dtype=np.int64)
+        self.graph = graph
+        if graph is not None:
+            face_ids = np.asarray(candidates, dtype=np.int64)
+            if np.any(face_ids < 0) or np.any(face_ids >= len(graph['face_to_node'])):
+                raise ValueError('Candidate face is absent from the policy graph')
+            indices = graph['face_to_node'][face_ids]
+            if (np.any(indices < 0) or np.any(indices >= len(graph['node_to_face'])) or
+                    not np.array_equal(graph['node_to_face'][indices], face_ids)):
+                raise ValueError('Candidate face is absent from or mismatched with the policy graph')
+            self.candidate_nodes = torch.as_tensor(indices, dtype=torch.long)
+            with torch.no_grad():
+                self.embeddings = policy.encode(graph)[self.candidate_nodes]
 
     def __call__(self, face_id, remaining):
         index = self.positions[face_id]
         self.features[index, 6] = remaining / self.budget if self.budget else 0.0
         with torch.no_grad():
-            logits = self.policy(torch.from_numpy(self.features[index:index + 1]))[0]
+            logits = (self.policy.score(self.embeddings[index:index + 1], [self.features[index, 6]])[0]
+                      if self.graph is not None else self.policy(torch.from_numpy(self.features[index:index + 1]))[0])
             probability = torch.sigmoid(logits)
             action = bool(probability >= .5) if self.deterministic else bool(
                 torch.rand((), generator=self.generator) < probability)
