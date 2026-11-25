@@ -202,9 +202,11 @@ class MultiRoundTest(unittest.TestCase):
             for path in (full_dir, interrupted_dir, resumed_dir):
                 os.mkdir(path)
             full = make_trainer(full_dir, ckpt, mesh)
+            full.opt.refine_observation_graph = True
             refinement_multiround.run_multiround(full, Dataset(), Dataset(), [0], [1])
 
             interrupted = make_trainer(interrupted_dir, ckpt, mesh)
+            interrupted.opt.refine_observation_graph = True
             real_save = refinement_multiround._save
 
             def save_then_interrupt(path, state):
@@ -215,6 +217,7 @@ class MultiRoundTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'simulated interruption'):
                     refinement_multiround.run_multiround(interrupted, Dataset(), Dataset(), [0], [1])
             resumed = make_trainer(resumed_dir, ckpt, mesh, os.path.join(interrupted_dir, 'trajectory.pt'))
+            resumed.opt.refine_observation_graph = True
             refinement_multiround.run_multiround(resumed, Dataset(), Dataset(), [0], [1])
             full_state = torch.load(os.path.join(full_dir, 'trajectory.pt'), map_location='cpu')
             resumed_state = torch.load(os.path.join(resumed_dir, 'trajectory.pt'), map_location='cpu')
@@ -231,6 +234,13 @@ class MultiRoundTest(unittest.TestCase):
             for key in full_state['policy']:
                 torch.testing.assert_close(full_state['policy'][key], resumed_state['policy'][key])
             self.assertEqual(len(resumed_state['transitions']), 3)
+            for transition in resumed_state['transitions']:
+                for path in transition['observation_graphs'].values():
+                    self.assertTrue(os.path.isfile(path))
+            for transition in full_state['transitions']:
+                with np.load(os.path.join(full_dir, transition['observation_graphs']['after'])) as graph:
+                    np.testing.assert_array_equal(graph['parent_face_id'], transition['parent_face_id'])
+                    self.assertEqual(len(graph['face_to_node']), transition['faces_after'])
             continued_dir = os.path.join(directory, 'continued')
             os.mkdir(continued_dir)
             continued = make_trainer(continued_dir, ckpt, mesh, os.path.join(full_dir, 'trajectory.pt'))

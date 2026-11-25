@@ -305,6 +305,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         requested_config = dict(config)
         old_options = dict(old_config.get('options', {}))
         requested_options = dict(requested_config.get('options', {}))
+        # Graph recording does not change the policy or the optimization trajectory.
+        for key in ('refine_observation_graph', 'refine_graph_self_loops'):
+            old_options.pop(key, None)
+            requested_options.pop(key, None)
         if 'refine_gradient_ema_warmup_steps' not in old_options and warmup_steps == 0:
             requested_options.pop('refine_gradient_ema_warmup_steps', None)
         # Older checkpoints predate silhouette supervision and used its zero default.
@@ -439,10 +443,23 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         model.triangles_errors = torch.tensor(sums, dtype=torch.float32, device=trainer.device)
         model.triangles_errors_cnt = torch.tensor(observations, dtype=torch.float32, device=trainer.device)
         current_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
-        visible, features, feature_info = candidate_features(
-            current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
-            len(selection_views), vertex_state['ema'], vertex_state['seen'], 1.0,
-            candidate_fraction, min_area)
+        graph_files = None
+        if getattr(opt, 'refine_observation_graph', False):
+            from nerf.refinement_graph import build_face_graph, save_face_graph
+            graph, visible, features, feature_info = build_face_graph(
+                current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
+                len(selection_views), vertex_state['ema'], vertex_state['seen'],
+                opt.refine_face_budget, opt.refine_face_budget, candidate_fraction, min_area,
+                getattr(opt, 'refine_graph_self_loops', False))
+            graph_files = {phase: os.path.abspath(os.path.join(opt.refine_experiment_output,
+                            'graph_round_{:04d}_{}.npz'.format(len(history) + t + 1, phase)))
+                           for phase in ('before', 'after')}
+            save_face_graph(graph_files['before'], graph)
+        else:
+            visible, features, feature_info = candidate_features(
+                current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
+                len(selection_views), vertex_state['ema'], vertex_state['seen'], 1.0,
+                candidate_fraction, min_area)
         decisions = SequentialFaceDecisions(policy, visible, features, opt.refine_face_budget, generator=generator)
         model.refine_and_decimate(export_mesh=False, candidate_order=visible,
                                   max_added_faces=opt.refine_face_budget, decision_fn=decisions)
@@ -459,6 +476,15 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         step_seed = (opt.seed + global_round) % (2 ** 32)
         indices = np.random.RandomState(step_seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
         training_losses = _train_branch(trainer, train_data, indices, step_seed, vertex_state, ema_beta)
+        if graph_files is not None:
+            updated_selection = _observe(trainer, val_data, selection_views)
+            updated_sums, updated_pixels, updated_views = visibility_counts(updated_selection, len(model.triangles))
+            updated_graph, _, _, _ = build_face_graph(
+                (model.vertices + model.vertices_offsets.detach()).cpu().numpy(), model.triangles.cpu().numpy(),
+                updated_sums, updated_pixels, updated_views, len(selection_views), vertex_state['ema'],
+                vertex_state['seen'], opt.refine_face_budget - event['added_faces'], opt.refine_face_budget,
+                candidate_fraction, min_area, getattr(opt, 'refine_graph_self_loops', False))
+            save_face_graph(graph_files['after'], updated_graph, parents)
         after = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
         evaluation_after = _observe_silhouette(trainer, val_data, evaluation_views)
         pixel_counts, rgb_before, rgb_after = _region_stats(before, after, count, 1)
@@ -484,7 +510,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         transitions.append({'round': global_round + 1, 'faces_before': count, 'faces_after': len(model.triangles),
                             'global_step': trainer.global_step, 'training_indices': indices, 'training_losses': training_losses, 'event': event,
                             'visible': visible, 'features': decisions.features, 'feature_scales': np.asarray(feature_info['normalization_scales']),
-                            'candidate_info': feature_info, 'vertex_mapping': vertex_mapping,
+                            'candidate_info': feature_info, 'vertex_mapping': vertex_mapping, 'observation_graphs': graph_files,
                             'actions': actions, 'probabilities': decisions.probabilities,
                             'decision_mask': decisions.decided, 'decision_log_probabilities': decisions.log_probabilities,
                             'decision_order': visible[decisions.decided].copy(), 'round_budget': opt.refine_face_budget,
@@ -512,6 +538,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'decision_log_probabilities': _json_values(transition['decision_log_probabilities']),
                       'remaining_budget': transition['remaining_budget'].tolist(),
                       'candidate_info': transition['candidate_info'],
+                      'observation_graphs': transition.get('observation_graphs'),
                       'candidate_features': transition['features'].tolist(),
                       'vertex_mapping': transition['vertex_mapping'].tolist(),
                       'action_status': [event['request_status'].get(int(face), 'hold') for face in transition['visible']],
@@ -581,6 +608,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'decision_log_probabilities': _json_values(transition['decision_log_probabilities']),
                   'remaining_budget': transition['remaining_budget'].tolist(),
                   'candidate_info': transition['candidate_info'],
+                  'observation_graphs': transition.get('observation_graphs'),
                   'candidate_features': transition['features'].tolist(),
                   'vertex_mapping': transition['vertex_mapping'].tolist(),
                   'feature_scales': transition['feature_scales'].tolist(), 'face_costs': transition['costs'].tolist(),

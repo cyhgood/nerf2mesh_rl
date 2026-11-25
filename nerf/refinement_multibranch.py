@@ -128,6 +128,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     _select_views(len(val_data.poses), 1, selection_views, evaluation_views)
     checkpoint_hash, mesh_hash = file_sha256(opt.ckpt), file_sha256(opt.mesh)
     policy = load_trajectory_policy(opt.refine_multibranch_policy, checkpoint_hash, mesh_hash)
+    if getattr(opt, 'refine_observation_graph', False) and not isinstance(policy, CandidatePolicy):
+        raise ValueError('Observation graph recording requires the current CandidatePolicy checkpoint')
     initial_policy = copy.deepcopy(policy.state_dict())
     model = trainer.model
     warmup_steps = getattr(opt, 'refine_gradient_ema_warmup_steps', 0)
@@ -221,6 +223,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             visible = np.flatnonzero(counts > 0)
             candidate_info = None
             decisions = None
+            graph_files = None
             candidate_mask = np.zeros(face_count, dtype=bool)
             candidate_feature_values = np.full((face_count, 9), np.nan, dtype=np.float32)
             request_probability = np.full(face_count, np.nan, dtype=np.float32)
@@ -228,10 +231,22 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             if method == 'rl' and (len(visible) or isinstance(policy, CandidatePolicy)):
                 if isinstance(policy, CandidatePolicy):
                     _, _, view_counts = visibility_counts(observations, face_count)
-                    visible, features, candidate_info = candidate_features(
-                        vertices, faces, sums, counts, view_counts, len(selection_views),
-                        vertex_state['ema'], vertex_state['seen'], 1.0 if round_budget else 0.0,
-                        policy.candidate_settings['fraction'], policy.candidate_settings['min_area'])
+                    if getattr(opt, 'refine_observation_graph', False):
+                        from nerf.refinement_graph import build_face_graph, save_face_graph
+                        graph, visible, features, candidate_info = build_face_graph(
+                            vertices, faces, sums, counts, view_counts, len(selection_views),
+                            vertex_state['ema'], vertex_state['seen'], round_budget, round_budget,
+                            policy.candidate_settings['fraction'], policy.candidate_settings['min_area'],
+                            getattr(opt, 'refine_graph_self_loops', False))
+                        graph_files = {phase: os.path.abspath(os.path.join(opt.refine_experiment_output,
+                                       'graph_{}_round_{:04d}_{}.npz'.format(branch_name, round_index + 1, phase)))
+                                       for phase in ('before', 'after')}
+                        save_face_graph(graph_files['before'], graph)
+                    else:
+                        visible, features, candidate_info = candidate_features(
+                            vertices, faces, sums, counts, view_counts, len(selection_views),
+                            vertex_state['ema'], vertex_state['seen'], 1.0 if round_budget else 0.0,
+                            policy.candidate_settings['fraction'], policy.candidate_settings['min_area'])
                     candidate_mask[visible] = True
                     decisions = SequentialFaceDecisions(policy, visible, features, round_budget, deterministic=True)
                     order = visible
@@ -280,6 +295,15 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                           vertex_state if method == 'rl' and isinstance(policy, CandidatePolicy) else None,
                           policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
             after_selection = _observe_silhouette(trainer, val_data, selection_views)
+            if graph_files is not None:
+                post_sums, post_pixels, post_views = visibility_counts(after_selection, len(model.triangles))
+                post_graph, _, _, _ = build_face_graph(
+                    (model.vertices + model.vertices_offsets.detach()).cpu().numpy(), model.triangles.cpu().numpy(),
+                    post_sums, post_pixels, post_views, len(selection_views), vertex_state['ema'], vertex_state['seen'],
+                    round_budget - actual, round_budget, policy.candidate_settings['fraction'],
+                    policy.candidate_settings['min_area'], getattr(opt, 'refine_graph_self_loops', False))
+                save_face_graph(graph_files['after'], post_graph,
+                                model.parent_face_id.cpu().numpy())
             rgb_counts, rgb_before, rgb_after = _region_stats(observations, after_selection, face_count, 1)
             sil_counts, sil_before, sil_after = _region_stats(observations, after_selection, face_count, 2, contour_radius)
             outcomes = edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after,
@@ -313,6 +337,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                      'round_budget': round_budget, 'actual_added_faces': actual,
                                      'face_observations': observations_file, 'contour_views': contour_views,
                                      'candidate_info': candidate_info,
+                                     'observation_graphs': graph_files,
                                      'edge_outcomes': outcomes,
                                      'cumulative_added_faces': cumulative, 'unfilled_budget': round_budget - actual,
                                      'training_indices': training_indices[round_index],

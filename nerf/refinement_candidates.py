@@ -120,7 +120,7 @@ def candidate_features(vertices, faces, sums, pixels, view_counts, num_views,
     ids = np.flatnonzero(valid)
     order = np.lexsort((ids, -areas[ids]))
     candidates = ids[order[:int(np.ceil(len(ids) * fraction))]]
-    gradient_valid = vertex_seen[faces].all(axis=1)
+    gradient_valid = (vertex_seen[faces] & np.isfinite(vertex_ema[faces]) & (vertex_ema[faces] >= 0)).all(axis=1)
     gradients = np.mean(vertex_ema[faces], axis=1)
     gradients[~gradient_valid] = 0.
     raw = np.stack((areas[candidates], sums[candidates] / pixels[candidates],

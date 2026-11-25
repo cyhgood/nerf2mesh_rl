@@ -130,6 +130,8 @@ if __name__ == '__main__':
     parser.add_argument('--refine_rl_eval', action='store_true', help='evaluate a loaded policy without updates')
     parser.add_argument('--refine_rl_eval_mode', choices=['rank', 'threshold'], default='rank', help='rank all visible faces or request only faces with sigmoid probability >= 0.5')
     parser.add_argument('--refine_multiround', action='store_true', help='run consecutive topology updates with face lineage rewards')
+    parser.add_argument('--refine_observation_graph', action='store_true', help='record sparse face graphs in multi-round training and evaluation; policy stays MLP')
+    parser.add_argument('--refine_graph_self_loops', action='store_true', help='add explicitly marked self loops to recorded observation graphs')
     parser.add_argument('--refine_multiround_rounds', type=int, default=3, help='maximum topology updates in this invocation')
     parser.add_argument('--refine_multiround_horizon', type=int, default=3, help='number of updates per truncated return segment')
     parser.add_argument('--refine_silhouette_radius', type=float, default=8.0, help='maximum pixel distance for assigning uncovered target silhouette to a face')

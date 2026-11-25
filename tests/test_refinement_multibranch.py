@@ -162,6 +162,7 @@ class MultiBranchTest(unittest.TestCase):
             opt.refine_candidate_fraction = .5
             opt.refine_min_face_area = 1e-12
             opt.refine_gradient_ema_beta = .9
+            opt.refine_observation_graph = True
             opt.refine_experiment_output = os.path.join(directory, 'candidates')
             os.mkdir(opt.refine_experiment_output)
             run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
@@ -170,6 +171,10 @@ class MultiBranchTest(unittest.TestCase):
             with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
                 candidate_result = json.load(source)
             rl = candidate_result['branches'][0]
+            for step in rl['rounds']:
+                with np.load(os.path.join(opt.refine_experiment_output, step['observation_graphs']['after'])) as graph:
+                    np.testing.assert_array_equal(graph['parent_face_id'], step['event']['parent_face_id'])
+                    self.assertEqual(len(graph['face_to_node']), step['faces_after'])
             self.assertEqual(rl['rounds'][0]['candidate_info']['valid_faces'], 2)
             self.assertEqual(rl['rounds'][0]['candidate_info']['candidate_faces'], 1)
             self.assertEqual(rl['rounds'][0]['candidate_info']['gradient_missing'], 1)
