@@ -74,7 +74,7 @@ class TextureTest(unittest.TestCase):
         rewarded = local_rewards(rgb, after_rgb, sil, sil, np.ones(2), np.zeros(2), [1, 1, .1, 2], pixels, before, last)
         self.assertTrue(np.isfinite(base).all())
         self.assertGreater(rewarded[0], base[0])
-        self.assertTrue(np.isnan(rewarded[1]))
+        self.assertAlmostEqual(rewarded[1], base[1])
 
     def test_shared_edge_gradient_attribution(self):
         event = {'edge_events': [{'edge': [0, 1], 'requester_face': 0, 'added_faces': 2,

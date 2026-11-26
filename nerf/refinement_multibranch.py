@@ -434,7 +434,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                      sil_counts, sil_before, sil_after, grad_counts, grad_before, grad_after)
             face_cost = edge_costs(event, face_count)
             face_reward = local_rewards(rgb_before, rgb_after, sil_before, sil_after, rgb_counts, face_cost,
-                                        result['selection_region_reward_weights'], grad_counts, grad_before, grad_after)
+                                        result['selection_region_reward_weights'], grad_counts, grad_before, grad_after,
+                                        sil_counts=sil_counts)
             np.savez_compressed(os.path.join(opt.refine_experiment_output, observations_file),
                                 face_id=np.arange(face_count), rgb_mean=means, visible_pixels=counts,
                                 area=areas, contour_near_pixels=near_counts,

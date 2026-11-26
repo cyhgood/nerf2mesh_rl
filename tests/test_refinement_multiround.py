@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from meshutils import subdivide_longest_edges
-from nerf.refinement_multiround import (edge_costs, lineage_returns, local_rewards, _region_stats,
+from nerf.refinement_multiround import (edge_costs, lineage_returns, local_rewards, _region_stats, split_face_reward_records,
                                         _silhouette_owners, face_policy_losses, reward_distributions, action_counts,
                                         grouped_rewards)
 from nerf import refinement_multiround
@@ -101,6 +101,54 @@ class MultiRoundTest(unittest.TestCase):
                                counts, np.array([2, 0]), [2., 3., 0.1])
         self.assertAlmostEqual(reward[0], 1.3)
         self.assertTrue(np.isnan(reward[1]))
+
+    def test_independent_reward_components_and_groups(self):
+        rgb0 = np.array([1., 1., np.nan, np.nan, 1.])
+        rgb1 = np.array([.8, .8, np.nan, np.nan, .8])
+        sil0 = np.array([.7, .7, .7, np.nan, .7])
+        sil1 = np.array([.6, .6, .6, np.nan, .6])
+        g0 = np.array([.5, np.nan, .5, np.nan, .5])
+        g1 = np.array([.3, np.nan, .3, np.nan, .3])
+        reward, terms = local_rewards(rgb0, rgb1, sil0, sil1, np.array([1, 1, 0, 0, 1]),
+                                      np.array([2, 0, 0, 0, np.nan]), [1., 1., .1, 2.],
+                                      np.array([1, 0, 1, 0, 1]), g0, g1,
+                                      sil_counts=np.array([1, 1, 1, 0, 1]), return_details=True)
+        np.testing.assert_allclose(reward[:3], [.5, .3, .5])
+        self.assertTrue(np.isnan(reward[3]))
+        self.assertTrue(np.isnan(reward[4]))
+        self.assertEqual(terms['gradient']['reason'][1], 1)
+        self.assertEqual(terms['rgb']['reason'][2], 1)
+        self.assertEqual(terms['face_cost']['reason'][4], 4)
+        disabled = local_rewards(rgb0, rgb1, sil0, sil1, np.array([1, 1, 0, 0, 1]),
+                                 np.array([2, 0, 0, 0, 0]), [1., 1., .1, 0.],
+                                 np.array([1, 0, 1, 0, 1]), g0, g1,
+                                 sil_counts=np.array([1, 1, 1, 0, 1]))
+        np.testing.assert_allclose(disabled[:3], [.1, .3, .1])
+        transition = {'reward_pixels': np.array([1, 1, 0, 0, 1]), 'silhouette_pixels': np.array([1, 1, 1, 0, 1]),
+                      'rgb_before': rgb0, 'rgb_after': rgb1, 'sil_before': sil0, 'sil_after': sil1,
+                      'grad_counts': np.array([1, 0, 1, 0, 1]), 'grad_before': g0, 'grad_after': g1,
+                      'costs': np.array([2, 0, 0, 0, np.nan]), 'reward': reward, 'reward_components': terms,
+                      'event': {'edge_events': [{'requester_face': 0}], 'passive_faces': [1], 'request_status': {}}}
+        groups = grouped_rewards(transition, [1., 1., .1, 2.])
+        executed = groups['executed']['independent_components']
+        passive = groups['passive']['independent_components']
+        self.assertEqual(executed['gradient']['valid_count'], 1)
+        self.assertAlmostEqual(executed['gradient']['raw_improvement']['mean'], .2)
+        self.assertAlmostEqual(executed['gradient']['weighted_contribution']['mean'], .4)
+        self.assertEqual(passive['gradient']['missing_reasons']['no_pixels'], 1)
+        self.assertAlmostEqual(passive['total_reward']['mean'], .3)
+        records = split_face_reward_records(transition)
+        self.assertEqual([record['face_id'] for record in records], [0, 1])
+        self.assertAlmostEqual(records[0]['components']['gradient']['weighted'], .4)
+        self.assertIsNone(records[1]['components']['gradient']['raw'])
+        _, reason_test = local_rewards(np.array([np.nan, 1.]), np.array([1., np.nan]),
+                                       np.zeros(2), np.zeros(2), np.ones(2), np.zeros(2), [1, 1, 0],
+                                       sil_counts=np.zeros(2), return_details=True)
+        self.assertEqual(reason_test['rgb']['reason'].tolist(), [2, 3])
+        grad_only = local_rewards(np.array([np.nan]), np.array([np.nan]), np.array([np.nan]), np.array([np.nan]),
+                                  np.array([0]), np.array([0]), [1, 1, 0, 1], np.array([2]),
+                                  np.array([.7]), np.array([.2]), sil_counts=np.array([0]))
+        self.assertAlmostEqual(grad_only[0], .5)
 
     def test_shared_edge_cost_and_budget(self):
         vertices = np.array([[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]])
@@ -280,8 +328,27 @@ class MultiRoundTest(unittest.TestCase):
             missing_state = torch.load(os.path.join(missing_dir, 'trajectory.pt'), map_location='cpu')
             missing_round = missing_state['transitions'][0]
             self.assertFalse(missing_round['grad_counts'].any())
-            self.assertTrue(np.isnan(missing_round['reward']).all())
-            self.assertIsNone(missing_round['policy_loss'])
+            self.assertTrue(np.isfinite(missing_round['reward']).any())
+            self.assertTrue((missing_round['reward_components']['gradient']['reason'] == 1).all())
+            old_reward = copy.deepcopy(gnn_state)
+            old_reward['config'].pop('reward_version')
+            old_reward.pop('reward_transition', None)
+            old_reward_path = os.path.join(directory, 'old_reward.pt')
+            torch.save(old_reward, old_reward_path)
+            changed_dir = os.path.join(directory, 'new_reward_segment')
+            os.mkdir(changed_dir)
+            changed = make_trainer(changed_dir, ckpt, mesh, old_reward_path)
+            changed.opt.refine_policy = 'gnn'
+            changed.opt.refine_multiround_rounds = 1
+            changed.opt.refine_multiround_horizon = 2
+            changed.opt.refine_multiround_grad_weight = 1.
+            changed.opt.refine_multiround_face_cost = 0.
+            refinement_multiround.run_multiround(changed, Dataset(), Dataset(), [0], [1])
+            changed_state = torch.load(os.path.join(changed_dir, 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(changed_state['reward_transition']['mode'], 'completed_checkpoint_new_reward')
+            self.assertTrue(changed_state['reward_transition']['policy_optimizer_reset'])
+            self.assertEqual(len(changed_state['policy_optimizer']['state']), 0)
+            self.assertEqual(changed_state['config']['weights'], [1., 1., 0., 1.])
             wrong = make_trainer(gnn_resume_dir, ckpt, mesh, os.path.join(gnn_dir, 'trajectory.pt'))
             with self.assertRaisesRegex(ValueError, 'Policy architecture mismatch'):
                 refinement_multiround.run_multiround(wrong, Dataset(), Dataset(), [0], [1])
@@ -363,6 +430,14 @@ class MultiRoundTest(unittest.TestCase):
             pending = torch.load(os.path.join(paths[1], 'trajectory.pt'), map_location='cpu')
             self.assertFalse(pending['completed'])
             self.assertEqual(len(pending['transitions']), 3)
+            old_pending = copy.deepcopy(pending)
+            old_pending['config'].pop('reward_version')
+            old_pending_path = os.path.join(directory, 'old_pending_reward.pt')
+            torch.save(old_pending, old_pending_path)
+            old_reward_trainer = make_trainer(paths[2], ckpt, mesh, old_pending_path)
+            old_reward_trainer.opt.refine_multiround_horizon = 6
+            with self.assertRaisesRegex(ValueError, 'different reward version or weights'):
+                refinement_multiround.run_multiround(old_reward_trainer, Dataset(), Dataset(), [0], [1])
             changed_loss = make_trainer(paths[2], ckpt, mesh, os.path.join(paths[1], 'trajectory.pt'))
             changed_loss.opt.refine_multiround_horizon = 6
             changed_loss.opt.lambda_sil = .25

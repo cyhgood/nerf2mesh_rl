@@ -19,6 +19,9 @@ from nerf.refinement_texture import fixed_gradient_regions, TEXTURE_FEATURE_VERS
 
 
 POLICY_OBJECTIVE = 'candidate_sequential_budget_stop_v5'
+REWARD_VERSION = 'partial_observation_components_v2'
+REWARD_REASON_CODES = {'valid': 0, 'no_pixels': 1, 'nonfinite_before': 2,
+                       'nonfinite_after': 3, 'invalid_cost': 4, 'invalid_pixel_count': 5}
 
 
 def edge_costs(event, face_count):
@@ -31,20 +34,40 @@ def edge_costs(event, face_count):
 
 
 def local_rewards(rgb_before, rgb_after, sil_before, sil_after, counts, costs, weights,
-                  grad_counts=None, grad_before=None, grad_after=None):
-    valid = counts > 0
+                  grad_counts=None, grad_before=None, grad_after=None, sil_counts=None, return_details=False):
+    """Sum each independently observed improvement; never impute a missing component."""
+    counts = np.asarray(counts)
+    n = len(counts)
+    costs = np.asarray(costs, dtype=np.float64)
+    sil_counts = counts if sil_counts is None else np.asarray(sil_counts)
+    if grad_counts is None:
+        grad_counts = np.zeros(n, dtype=np.int64)
+        grad_before = grad_after = np.full(n, np.nan)
+    def component(before, after, pixels, weight):
+        before, after, pixels = np.asarray(before), np.asarray(after), np.asarray(pixels)
+        reason = np.zeros(n, dtype=np.uint8)
+        reason[pixels <= 0] = 1
+        reason[~np.isfinite(pixels)] = 5
+        reason[(reason == 0) & ~np.isfinite(before)] = 2
+        reason[(reason == 0) & ~np.isfinite(after)] = 3
+        valid = reason == 0
+        raw = np.full(n, np.nan)
+        raw[valid] = before[valid] - after[valid]
+        return {'valid': valid, 'reason': reason, 'raw': raw, 'weighted': raw * weight}
     grad_weight = weights[3] if len(weights) > 3 else 0.
-    if grad_weight > 0:
-        if grad_counts is None:
-            raise ValueError('Gradient reward requires fixed-region gradient observations')
-        valid = valid & (grad_counts > 0) & np.isfinite(grad_before) & np.isfinite(grad_after)
-    reward = np.full(len(counts), np.nan)
-    reward[valid] = (weights[0] * (sil_before[valid] - sil_after[valid]) +
-                     weights[1] * (rgb_before[valid] - rgb_after[valid]) -
-                     weights[2] * costs[valid])
-    if grad_weight > 0:
-        reward[valid] += grad_weight * (grad_before[valid] - grad_after[valid])
-    return reward
+    details = {'rgb': component(rgb_before, rgb_after, counts, weights[1]),
+               'silhouette': component(sil_before, sil_after, sil_counts, weights[0]),
+               'gradient': component(grad_before, grad_after, grad_counts, grad_weight)}
+    cost_valid = np.isfinite(costs) & (costs >= 0)
+    details['face_cost'] = {'valid': cost_valid, 'reason': np.where(cost_valid, 0, 4).astype(np.uint8),
+                            'raw': np.where(cost_valid, costs, np.nan),
+                            'weighted': np.where(cost_valid, -weights[2] * costs, np.nan)}
+    valid = cost_valid & (details['rgb']['valid'] | details['silhouette']['valid'] | details['gradient']['valid'])
+    total = np.zeros(n, dtype=np.float64)
+    for value in details.values():
+        total += np.where(value['valid'], value['weighted'], 0.)
+    reward = np.where(valid, total, np.nan)
+    return (reward, details) if return_details else reward
 
 
 def lineage_returns(transitions, gamma, return_missing=False):
@@ -149,8 +172,50 @@ def reward_distributions(transition, weights, returns=None, face_ids=None):
         gv = valid & (transition['grad_counts'] > 0) & np.isfinite(transition['grad_before']) & np.isfinite(transition['grad_after'])
         gradient[gv] = (weights[3] if len(weights) > 3 else 0.) * (transition['grad_before'][gv] - transition['grad_after'][gv])
     return {'silhouette': _distribution(silhouette), 'rgb': _distribution(rgb),
-            'gradient': _distribution(gradient), 'face_cost': _distribution(cost), 'local_reward': _distribution(transition['reward']),
+            'gradient': _distribution(gradient), 'face_cost': _distribution(cost),
+            'local_reward': _distribution(np.where(valid, transition['reward'], np.nan)),
             'lineage_return': _distribution([] if returns is None else np.where(valid, returns, np.nan))}
+
+
+def component_distributions(transition, face_ids):
+    """Per-group independent counts and magnitudes, plus per-face missing reasons."""
+    details = transition.get('reward_components')
+    if details is None:
+        return None
+    ids = np.asarray(sorted(face_ids), dtype=np.int64)
+    components = {}
+    for name, value in details.items():
+        reasons = value['reason'][ids]
+        components[name] = {'valid_count': int(np.count_nonzero(reasons == 0)),
+                            'missing_reasons': {label: int(np.count_nonzero(reasons == code))
+                                                for label, code in REWARD_REASON_CODES.items() if code},
+                            'raw_improvement' if name != 'face_cost' else 'raw_added_faces': _distribution(value['raw'][ids]),
+                            'weighted_contribution': _distribution(value['weighted'][ids])}
+    components['total_reward'] = _distribution(transition['reward'][ids])
+    components['valid_reward_count'] = int(np.isfinite(transition['reward'][ids]).sum())
+    return components
+
+
+def split_face_reward_records(transition):
+    details = transition.get('reward_components')
+    if details is None:
+        return []
+    event = transition['event']
+    requesters = {int(edge['requester_face']) for edge in event['edge_events']}
+    passive = set(map(int, event['passive_faces']))
+    records = []
+    for face in sorted(requesters | passive):
+        components = {}
+        for name, data in details.items():
+            raw, weighted = data['raw'][face], data['weighted'][face]
+            components[name] = {'valid': bool(data['valid'][face]), 'reason_code': int(data['reason'][face]),
+                                'raw': float(raw) if np.isfinite(raw) else None,
+                                'weighted': float(weighted) if np.isfinite(weighted) else None}
+        reward = transition['reward'][face]
+        records.append({'face_id': face, 'executed_requester': face in requesters,
+                        'passive_neighbor': face in passive, 'components': components,
+                        'total_reward': float(reward) if np.isfinite(reward) else None})
+    return records
 
 
 def grouped_rewards(transition, weights, returns=None):
@@ -164,7 +229,8 @@ def grouped_rewards(transition, weights, returns=None):
     result = {}
     for name, faces in [('executed', executed), ('passive', passive),
                         ('unexecuted', unexecuted), ('not_considered', not_considered)]:
-        result[name] = {'faces': len(faces), 'same_valid_set': reward_distributions(transition, weights, returns, faces)}
+        result[name] = {'faces': len(faces), 'same_valid_set': reward_distributions(transition, weights, returns, faces),
+                        'independent_components': component_distributions(transition, faces)}
     return result
 
 
@@ -296,6 +362,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'steps': opt.refine_experiment_steps, 'rounds': opt.refine_multiround_rounds,
               'horizon': horizon, 'silhouette_radius': radius,
               'gamma': opt.refine_multiround_gamma, 'weights': weights, 'policy_lr': opt.refine_rl_lr,
+              'reward_version': REWARD_VERSION,
+              'reward_missing_rule': 'sum valid RGB, silhouette and gradient improvements independently; require at least one observation and valid cost',
+              'reward_reason_codes': REWARD_REASON_CODES,
+              'reward_status_codes': {'valid': 0, 'no_valid_reconstruction_observation': 1, 'invalid_cost': 2},
               'silhouette_error': 'absolute antialiased raster alpha minus ground-truth alpha',
               'pixel_regions': 'pre-update face index; uncovered target pixels assigned to nearest face within radius for silhouette',
               'lineage_weights': 'child area after optimization normalized over each parent',
@@ -328,10 +398,34 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     vertex_mapping = np.repeat(np.arange(len(model.vertices))[:, None], 2, axis=1)
     ema_initialization = 'zero_initial_mesh'
     ema_warmup = None
+    reward_transition = {'mode': 'new_training', 'version': REWARD_VERSION, 'weights': weights}
     if opt.refine_multiround_resume:
         saved = torch.load(opt.refine_multiround_resume, map_location='cpu')
         old_config = dict(saved['config'])
         requested_config = dict(config)
+        old_reward_version = old_config.pop('reward_version', 'strict_observations_v1')
+        requested_config.pop('reward_version')
+        old_config.pop('reward_missing_rule', None)
+        requested_config.pop('reward_missing_rule')
+        old_config.pop('reward_reason_codes', None)
+        requested_config.pop('reward_reason_codes')
+        old_config.pop('reward_status_codes', None)
+        requested_config.pop('reward_status_codes')
+        old_reward_weights = list(old_config.get('weights', []))
+        if len(old_reward_weights) == 3:
+            old_reward_weights.append(0.)
+        reward_changed = old_reward_version != REWARD_VERSION or old_reward_weights != weights
+        if not saved['completed'] and reward_changed:
+            raise ValueError('Cannot resume an open segment with a different reward version or weights; use a completed checkpoint or start from Stage 1')
+        if saved['completed']:
+            old_config.pop('weights', None)
+            requested_config.pop('weights')
+        reward_transition = {'mode': 'completed_checkpoint_new_reward' if saved['completed'] and reward_changed else 'resume_same_reward',
+                             'source_version': old_reward_version, 'source_weights': old_reward_weights,
+                             'version': REWARD_VERSION, 'weights': weights,
+                             'policy_optimizer_reset': bool(saved['completed'] and reward_changed)}
+        if not saved['completed']:
+            reward_transition = saved.get('reward_transition', reward_transition)
         old_texture_version = old_config.pop('texture_feature_version', None)
         requested_texture_version = requested_config.pop('texture_feature_version')
         old_config.pop('texture_definition', None)
@@ -350,6 +444,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             raise ValueError('Texture feature version mismatch: old GNN checkpoint cannot resume; retrain the texture GNN')
         old_options = dict(old_config.get('options', {}))
         requested_options = dict(requested_config.get('options', {}))
+        if saved['completed']:
+            for key in ('refine_multiround_sil_weight', 'refine_multiround_rgb_weight',
+                        'refine_multiround_face_cost', 'refine_multiround_grad_weight'):
+                old_options.pop(key, None)
+                requested_options.pop(key, None)
         if 'refine_multiround_grad_weight' not in old_options and weights[3] == 0:
             requested_options.pop('refine_multiround_grad_weight', None)
         # Graph recording does not change the policy or the optimization trajectory.
@@ -438,10 +537,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         if old_feature_version == FEATURE_VERSION:
             policy.load_state_dict(saved['policy'])
         if old_feature_version == FEATURE_VERSION:
-            if old_objective == POLICY_OBJECTIVE:
+            if old_objective == POLICY_OBJECTIVE and not reward_changed:
                 optimizer.load_state_dict(saved['policy_optimizer'])
             else:
-                trainer.log('[INFO] policy objective changed; retained policy and EMA with a fresh policy optimizer')
+                trainer.log('[INFO] policy objective or reward changed; retained policy and EMA with a fresh policy optimizer')
             if any(key not in saved for key in ('vertex_gradient_ema', 'vertex_gradient_seen', 'vertex_mapping')):
                 raise ValueError('Candidate-policy checkpoint is missing vertex EMA or mapping')
             vertex_state = {'ema': np.asarray(saved['vertex_gradient_ema'], dtype=np.float64),
@@ -478,6 +577,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                  'vertex_gradient_ema': vertex_state['ema'], 'vertex_gradient_seen': vertex_state['seen'],
                  'vertex_mapping': vertex_mapping, 'ema_initialization': ema_initialization,
                  'ema_warmup': ema_warmup,
+                 'reward_transition': reward_transition,
                  'generator_state': generator.get_state(), 'history': history, 'transitions': transitions}
         _save(os.path.join(opt.refine_experiment_output, 'trajectory.pt'), state)
 
@@ -558,8 +658,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         else:
             grad_counts = np.zeros(count, dtype=np.int64)
             grad_before = grad_after = np.full(count, np.nan)
-        rewards = local_rewards(rgb_before, rgb_after, sil_before, sil_after, pixel_counts, costs, weights,
-                                grad_counts, grad_before, grad_after)
+        rewards, reward_components = local_rewards(rgb_before, rgb_after, sil_before, sil_after, pixel_counts, costs, weights,
+                                                   grad_counts, grad_before, grad_after, sil_counts=sil_counts,
+                                                   return_details=True)
+        reward_status = np.where(~reward_components['face_cost']['valid'], 2,
+                                 np.where(np.isfinite(rewards), 0, 1)).astype(np.uint8)
         outcomes = edge_outcomes(event, count, pixel_counts, rgb_before, rgb_after,
                                  sil_counts, sil_before, sil_after, grad_counts, grad_before, grad_after)
         child_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
@@ -590,6 +693,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
                             'sil_before': sil_before, 'sil_after': sil_after, 'reward': rewards,
                             'grad_counts': grad_counts, 'grad_before': grad_before, 'grad_after': grad_after,
+                            'reward_components': reward_components,
+                            'reward_status': reward_status,
                             'edge_outcomes': outcomes,
                             'evaluation': evaluation})
         snapshot(False)
@@ -624,16 +729,19 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'grad_pixels': transition.get('grad_counts', np.zeros_like(transition['reward_pixels'])).tolist(),
                       'grad_before': _json_values(transition.get('grad_before', np.full_like(transition['rgb_before'], np.nan))),
                       'grad_after': _json_values(transition.get('grad_after', np.full_like(transition['rgb_after'], np.nan))),
+                      'reward_component_reason_codes': {name: value['reason'].tolist() for name, value in transition.get('reward_components', {}).items()},
+                      'reward_status_codes': transition.get('reward_status', np.where(np.isfinite(transition['reward']), 0, 1)).tolist(),
                       'local_reward': _json_values(transition['reward']), 'lineage_return': None,
                       'reward_distributions': reward_distributions(transition, weights),
                       'reward_groups': grouped_rewards(transition, weights),
+                      'split_face_rewards': split_face_reward_records(transition),
                       'edge_outcomes': transition.get('edge_outcomes'),
                       'policy_loss': None, 'evaluation': transition['evaluation']}
             record.update(action_counts(transition))
             with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}_pending.json'.format(transition['round'])), 'w') as output:
                 json.dump(record, output, indent=2, allow_nan=False)
         with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
-            json.dump(dict(config, segment_status='open', segment_rounds=len(transitions),
+            json.dump(dict(config, segment_status='open', segment_rounds=len(transitions), reward_transition=reward_transition,
                            ema_initialization=ema_initialization, ema_warmup=ema_warmup), output, indent=2)
         trainer.log('[INFO] open return segment: {}/{} rounds; resume trajectory.pt'.format(len(transitions), horizon))
         return
@@ -660,6 +768,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'policy_loss': transition['policy_loss'],
                   'reward_distributions': reward_distributions(transition, weights, values),
                   'reward_groups': grouped_rewards(transition, weights, values),
+                  'split_face_rewards': split_face_reward_records(transition),
                   'edge_outcomes': transition.get('edge_outcomes'),
                   'advantage_stats': advantage_stats[t],
                   'missing_descendants': None if child_stats[t] is None else {
@@ -694,6 +803,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'grad_pixels': transition.get('grad_counts', np.zeros_like(transition['reward_pixels'])).tolist(),
                   'grad_before': _json_values(transition.get('grad_before', np.full_like(transition['rgb_before'], np.nan))),
                   'grad_after': _json_values(transition.get('grad_after', np.full_like(transition['rgb_after'], np.nan))),
+                  'reward_component_reason_codes': {name: value['reason'].tolist() for name, value in transition.get('reward_components', {}).items()},
+                  'reward_status_codes': transition.get('reward_status', np.where(np.isfinite(transition['reward']), 0, 1)).tolist(),
                   'local_reward': _json_values(transition['reward']), 'lineage_return': _json_values(values)}
         record.update(action_counts(transition))
         with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}.json'.format(transition['round'])), 'w') as output:
@@ -701,6 +812,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     snapshot(True)
     with open(os.path.join(opt.refine_experiment_output, 'metadata.json'), 'w') as output:
         json.dump(dict(config, segment_status='complete', ema_initialization=ema_initialization, ema_warmup=ema_warmup,
+                       reward_transition=reward_transition,
                        segment_start_round=transitions[0]['round'],
                        segment_terminal_round=transitions[-1]['round']), output, indent=2, allow_nan=False)
     trainer.log('[INFO] multi-round trajectory saved to ' + opt.refine_experiment_output)
