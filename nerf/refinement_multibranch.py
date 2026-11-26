@@ -69,14 +69,18 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
     return policy
 
 
-def full_frame_metrics(observations, views, expected_shapes):
+def full_frame_metrics(observations, views, expected_shapes, gradient_masks=None):
     per_view = []
     rgb_total = 0.0
     sil_total = 0.0
     pixels_total = 0
+    gradient_total = 0.0
+    gradient_pixels_total = 0
     if len(observations) != len(views) or len(views) != len(expected_shapes):
         raise ValueError('Evaluation views do not match the fixed pixel set')
-    for view, observation, shape in zip(views, observations, expected_shapes):
+    if gradient_masks is not None and len(gradient_masks) != len(views):
+        raise ValueError('Gradient masks do not match the fixed evaluation views')
+    for index, (view, observation, shape) in enumerate(zip(views, observations, expected_shapes)):
         if tuple(observation[4]) != tuple(shape):
             raise ValueError('Evaluation image dimensions changed between branches')
         rgb = observation[1]
@@ -89,13 +93,31 @@ def full_frame_metrics(observations, views, expected_shapes):
         rgb_total += rgb_sum
         sil_total += sil_sum
         pixels_total += pixels
-        per_view.append({'view_id': int(view), 'pixels': pixels,
-                         'rgb_error': rgb_sum / pixels, 'silhouette_error': sil_sum / pixels})
+        row = {'view_id': int(view), 'pixels': pixels,
+               'rgb_error': rgb_sum / pixels, 'silhouette_error': sil_sum / pixels}
+        if gradient_masks is not None:
+            if len(observation) != 10:
+                raise ValueError('Gradient evaluation requires Sobel error and target-only mask')
+            mask = np.asarray(gradient_masks[index], dtype=bool).reshape(-1)
+            if len(mask) != pixels or not np.array_equal(mask, observation[9]):
+                raise ValueError('Evaluation target foreground mask changed between branches')
+            # Do not silently drop a different set of pixels for a nonfinite rendering.
+            if np.any(mask & (~observation[7] | ~np.isfinite(observation[6]))):
+                raise ValueError('Nonfinite rendered RGB in the fixed gradient evaluation region')
+            count = int(mask.sum())
+            value = float(np.sum(observation[6][mask], dtype=np.float64))
+            gradient_total += value
+            gradient_pixels_total += count
+            row.update(gradient_error=value / count if count else None, gradient_valid_pixels=count)
+        per_view.append(row)
     if not pixels_total:
         raise ValueError('Evaluation pixel set is empty')
-    return {'per_view': per_view, 'overall': {'pixels': pixels_total,
-                                               'rgb_error': rgb_total / pixels_total,
-                                               'silhouette_error': sil_total / pixels_total}}
+    overall = {'pixels': pixels_total, 'rgb_error': rgb_total / pixels_total,
+               'silhouette_error': sil_total / pixels_total}
+    if gradient_masks is not None:
+        overall.update(gradient_error=gradient_total / gradient_pixels_total if gradient_pixels_total else None,
+                       gradient_valid_pixels=gradient_pixels_total)
+    return {'per_view': per_view, 'overall': overall}
 
 
 def _save_json(path, value):
@@ -192,9 +214,13 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         old_vertices, old_triangles = model.vertices.clone(), model.triangles.clone()
         old_v_cumsum, old_f_cumsum = model.v_cumsum.copy(), model.f_cumsum.copy()
         scaler_state, start_step = copy.deepcopy(trainer.scaler.state_dict()), trainer.global_step
-    initial = _observe_silhouette(trainer, val_data, evaluation_views)
+    initial = _observe_silhouette(trainer, val_data, evaluation_views, texture=True, texture_target_mask=True)
     shapes = [item[4] for item in initial]
-    initial_metrics = full_frame_metrics(initial, evaluation_views, shapes)
+    gradient_masks = [item[9].copy() for item in initial]
+    initial_metrics = full_frame_metrics(initial, evaluation_views, shapes, gradient_masks)
+    gradient_mask_path = os.path.join(opt.refine_experiment_output, 'evaluation_gradient_masks.npz')
+    np.savez_compressed(gradient_mask_path, **{'view_{}'.format(view): mask.reshape(shape)
+                                               for view, mask, shape in zip(evaluation_views, gradient_masks, shapes)})
 
     def restore():
         model.vertices = old_vertices.clone()
@@ -226,6 +252,15 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
               'evaluation_shapes': [list(shape) for shape in shapes],
               'rgb_metric': 'RGB mean SmoothL1 on white background',
               'silhouette_metric': 'absolute antialiased raster alpha minus ground-truth alpha',
+              'gradient_metric': {'definition': 'mean SmoothL1 of Sobel / 8 derivatives over RGB and x/y, then pixels',
+                                  'color_space': getattr(opt, 'color_space', 'srgb'),
+                                  'background': 'fixed white',
+                                  'mask': 'fixed target-only: finite RGB and alpha >= 0.999 across entire 3x3 stencil; independent of mesh coverage',
+                                  'boundary': 'replicate convolution padding; boundary centers excluded by stencil',
+                                  'normalization': 'Sobel / 8; average six channel/direction errors per pixel, then pixel-weighted mean across views',
+                                  'nonfinite_rendering': 'raise error instead of changing the fixed pixel set',
+                                  'mask_file': os.path.abspath(gradient_mask_path),
+                                  'mask_sha256': file_sha256(gradient_mask_path)},
               'initial_faces': len(old_triangles), 'initial_global_step': start_step,
               'checkpoint_global_step': checkpoint_step, 'ema_warmup': ema_warmup,
               'initial_metrics': initial_metrics, 'rounds': opt.refine_multibranch_rounds,
@@ -418,8 +453,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                 gradient_pixels=grad_counts, gradient_before=grad_before, gradient_after=grad_after,
                                 texture_strength_sum=texture_sum, texture_error_sum=texture_error_sum,
                                 texture_pixels=texture_counts)
-            metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
-                                         evaluation_views, shapes)
+            metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views,
+                                                              texture=True, texture_target_mask=True),
+                                         evaluation_views, shapes, gradient_masks)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
                                      'policy_evaluation_mode': (policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
                                      'initial_candidate_probability_distribution': probability_distribution(initial_probability) if decisions is not None else None,

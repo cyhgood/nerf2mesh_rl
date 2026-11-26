@@ -14,7 +14,7 @@ from nerf.refinement_multibranch import (full_frame_metrics, load_trajectory_pol
 from nerf.refinement_rl import FacePolicy, file_sha256
 from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION
 from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, POLICY_VERSION, TEXTURE_POLICY_VERSION
-from nerf.refinement_texture import TEXTURE_FEATURE_VERSION
+from nerf.refinement_texture import TEXTURE_FEATURE_VERSION, sobel_observation, target_sobel_mask
 
 
 class MultiBranchTest(unittest.TestCase):
@@ -43,6 +43,43 @@ class MultiBranchTest(unittest.TestCase):
         self.assertEqual(a['overall']['silhouette_error'], 0.5)
         with self.assertRaises(ValueError):
             full_frame_metrics(second, [4], [(3, 1)])
+
+    def test_gradient_fixed_target_region_and_invalid_render(self):
+        target = torch.zeros(5, 5, 3)
+        target[:, 3:] = 1.
+        alpha = torch.ones(5, 5)
+        alpha[0, 0] = 0.
+        target_mask = target_sobel_mask(target, alpha)
+        self.assertEqual(target_mask.sum(), 8)
+
+        def observation(pred, faces, alpha_value=alpha):
+            rgb = torch.nn.functional.smooth_l1_loss(pred, target, reduction='none').mean(-1)
+            return (faces.numpy().reshape(-1), rgb.numpy().reshape(-1), np.zeros(25),
+                    alpha_value.numpy().reshape(-1), (5, 5),
+                    *sobel_observation(pred, target, alpha_value, faces), target_sobel_mask(target, alpha_value))
+
+        a = observation(torch.zeros_like(target), torch.zeros(5, 5, dtype=torch.long))
+        b = observation(target, torch.full((5, 5), -1, dtype=torch.long))
+        ma = full_frame_metrics([a, a], [0, 1], [(5, 5), (5, 5)], [target_mask, target_mask])
+        mb = full_frame_metrics([b, b], [0, 1], [(5, 5), (5, 5)], [target_mask, target_mask])
+        self.assertEqual(ma['overall']['gradient_valid_pixels'], 16)
+        self.assertEqual(mb['overall']['gradient_valid_pixels'], 16)
+        self.assertGreater(ma['overall']['gradient_error'], 0.)
+        self.assertEqual(mb['overall']['gradient_error'], 0.)
+        self.assertEqual(ma['per_view'][0]['gradient_valid_pixels'], 8)
+        bad = target.clone(); bad[2, 2, 0] = float('nan')
+        invalid = observation(bad, torch.zeros(5, 5, dtype=torch.long))
+        with self.assertRaisesRegex(ValueError, 'Nonfinite rendered RGB'):
+            full_frame_metrics([invalid], [0], [(5, 5)], [target_mask])
+        altered_alpha = alpha.clone(); altered_alpha[2, 2] = 0.
+        changed = observation(target, torch.zeros(5, 5, dtype=torch.long), altered_alpha)
+        with self.assertRaisesRegex(ValueError, 'foreground mask changed'):
+            full_frame_metrics([changed], [0], [(5, 5)], [target_mask])
+        empty_alpha = torch.zeros(5, 5)
+        empty = observation(target, torch.zeros(5, 5, dtype=torch.long), empty_alpha)
+        empty_result = full_frame_metrics([empty], [0], [(5, 5)], [target_sobel_mask(target, empty_alpha)])
+        self.assertIsNone(empty_result['overall']['gradient_error'])
+        self.assertEqual(empty_result['overall']['gradient_valid_pixels'], 0)
 
     def test_fixed_policy_budget_and_identical_training_sequences(self):
         starts = []
@@ -260,9 +297,15 @@ class MultiBranchTest(unittest.TestCase):
             with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
                 ranked = json.load(source)
             self.assertEqual(ranked['policy_evaluation_mode'], 'rank')
+            with np.load(ranked['gradient_metric']['mask_file'], allow_pickle=False) as mask_data:
+                self.assertEqual(mask_data['view_1'].shape, (1, 3))
+                self.assertEqual(mask_data['view_1'].sum(), 0)
+            self.assertEqual(ranked['initial_metrics']['overall']['gradient_valid_pixels'], 0)
             for branch in ranked['branches'][:2]:
                 first = branch['rounds'][0]
                 self.assertEqual(first['policy_evaluation_mode'], 'rank')
+                self.assertEqual(first['metrics']['overall']['gradient_valid_pixels'], 0)
+                self.assertIsNone(first['metrics']['overall']['gradient_error'])
                 self.assertLess(first['initial_candidate_probability_distribution']['max'], .5)
                 self.assertGreater(first['actual_added_faces'], 0)
                 self.assertGreater(first['requested_count'], 0)

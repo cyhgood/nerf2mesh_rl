@@ -10,6 +10,22 @@ TEXTURE_DEFINITION = ('eval RGB color_space; fixed white compositing; Sobel / 8;
                       'image boundary excluded; selection additionally requires 3x3 mesh coverage')
 
 
+def _full_stencil(mask):
+    value = F.conv2d(mask.float()[None, None], torch.ones((1, 1, 3, 3), device=mask.device), padding=1)
+    return value[0, 0] == 9
+
+
+def target_sobel_mask(target, alpha):
+    """Fixed target-only stencil: never depends on a branch's rendering or mesh."""
+    target = torch.as_tensor(target).float()
+    alpha = torch.as_tensor(alpha, device=target.device).float()
+    if target.ndim != 3 or target.shape[-1] != 3:
+        raise ValueError('Sobel target requires an H x W x 3 image')
+    alpha = alpha.reshape(target.shape[:2])
+    valid = torch.isfinite(target).all(-1) & torch.isfinite(alpha) & (alpha >= .999)
+    return _full_stencil(valid).detach().cpu().numpy().reshape(-1).copy()
+
+
 def sobel_observation(prediction, target, alpha, face_ids):
     prediction = torch.as_tensor(prediction).float()
     target = torch.as_tensor(target, device=prediction.device).float()
@@ -22,9 +38,6 @@ def sobel_observation(prediction, target, alpha, face_ids):
     finite = torch.isfinite(prediction).all(-1) & torch.isfinite(target).all(-1) & torch.isfinite(alpha)
     foreground = finite & (alpha >= .999)
     coverage = foreground & (face_ids >= 0)
-    def stencil(mask):
-        value = F.conv2d(mask.float()[None, None], torch.ones((1, 1, 3, 3), device=mask.device), padding=1)
-        return value[0, 0] == 9
     pred = torch.nan_to_num(prediction).permute(2, 0, 1)[None]
     gt = torch.nan_to_num(target).permute(2, 0, 1)[None]
     kernel = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=pred.device) / 8
@@ -34,7 +47,7 @@ def sobel_observation(prediction, target, alpha, face_ids):
     strength = grad_gt.reshape(1, 3, 2, h, w).square().sum(2).mean(1).sqrt()[0]
     error = F.smooth_l1_loss(grad_pred, grad_gt, reduction='none').mean(1)[0]
     return tuple(x.detach().cpu().numpy().reshape(-1).copy() for x in
-                 (strength, error, stencil(foreground), stencil(coverage)))
+                 (strength, error, _full_stencil(foreground), _full_stencil(coverage)))
 
 
 def texture_face_sums(observations, face_count):

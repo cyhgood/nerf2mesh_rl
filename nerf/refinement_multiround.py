@@ -184,7 +184,7 @@ def action_counts(transition):
             'already_split_count': statuses.count('already_split')}
 
 
-def _observe_silhouette(trainer, dataset, views, training_dataset=False, texture=False):
+def _observe_silhouette(trainer, dataset, views, training_dataset=False, texture=False, texture_target_mask=False):
     observations = []
     trainer.model.eval()
     with torch.no_grad():
@@ -205,6 +205,9 @@ def _observe_silhouette(trainer, dataset, views, training_dataset=False, texture
             if texture:
                 from nerf.refinement_texture import sobel_observation
                 observation += sobel_observation(prediction, target, images[..., 3], faces)
+                if texture_target_mask:
+                    from nerf.refinement_texture import target_sobel_mask
+                    observation += (target_sobel_mask(target, images[..., 3]),)
             observations.append(observation)
     return observations
 
