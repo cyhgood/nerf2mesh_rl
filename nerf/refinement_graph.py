@@ -18,6 +18,36 @@ def graph_budget_state(graph, remaining_budget, round_budget):
     return features, graph['candidate_mask'] & (remaining_budget > 0)
 
 
+def add_texture_features(graph, observations):
+    """Attach two selection-view face averages and one missing bit, using candidate medians."""
+    from nerf.refinement_texture import texture_face_sums, TEXTURE_FEATURE_VERSION, TEXTURE_DEFINITION
+    sums_t, sums_e, counts = texture_face_sums(observations, len(graph['face_to_node']))
+    ids = graph['node_to_face']
+    valid = counts[ids] > 0
+    raw = np.zeros((len(ids), 2), dtype=np.float64)
+    np.divide(sums_t[ids], counts[ids], out=raw[:, 0], where=valid)
+    np.divide(sums_e[ids], counts[ids], out=raw[:, 1], where=valid)
+    fit = valid & graph['candidate_mask']
+    scales = np.array([np.median(raw[fit, i][raw[fit, i] > 0]) if np.any(raw[fit, i] > 0) else 1.
+                       for i in range(2)])
+    normalized = np.minimum(np.log1p(raw / scales), 5.)
+    graph['node_features'] = np.column_stack((graph['node_features'], normalized, ~valid)).astype(np.float32)
+    graph['texture_raw'] = np.where(valid[:, None], raw, np.nan)
+    graph['texture_valid'] = valid
+    graph['texture_pixel_count'] = counts[ids]
+    graph['metadata']['texture_feature_version'] = TEXTURE_FEATURE_VERSION
+    graph['metadata']['texture_definition'] = TEXTURE_DEFINITION
+    graph['metadata']['texture_normalization_scales'] = scales.tolist()
+    graph['metadata']['node_feature_names'] += ['texture_strength_log', 'texture_error_log', 'texture_missing']
+    graph['metadata']['texture_valid_nodes'] = int(valid.sum())
+    graph['metadata']['candidate_info']['texture'] = {
+        'feature_version': TEXTURE_FEATURE_VERSION, 'normalization_scales': scales.tolist(),
+        'valid_nodes': int(valid.sum()), 'valid_candidates': int(fit.sum()),
+        'strength_sum': float(sums_t.sum()), 'error_sum': float(sums_e.sum()),
+        'valid_pixels': int(counts.sum()), 'definition': TEXTURE_DEFINITION}
+    return graph
+
+
 def build_face_graph(vertices, faces, sums, pixels, view_counts, num_views, vertex_ema,
                      vertex_seen, remaining_budget, round_budget, fraction=.5, min_area=1e-12,
                      self_loops=False):

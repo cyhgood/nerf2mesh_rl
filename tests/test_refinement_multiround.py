@@ -260,18 +260,40 @@ class MultiRoundTest(unittest.TestCase):
             gnn_state = torch.load(os.path.join(gnn_dir, 'trajectory.pt'), map_location='cpu')
             gnn_restored = torch.load(os.path.join(gnn_resume_dir, 'trajectory.pt'), map_location='cpu')
             self.assertEqual(gnn_state['config']['policy_type'], 'gnn')
-            from nerf.refinement_gnn import SparseFacePolicy
+            from nerf.refinement_gnn import TextureFacePolicy
             torch.manual_seed(42)
-            initial_gnn = SparseFacePolicy().state_dict()
+            initial_gnn = TextureFacePolicy().state_dict()
             self.assertTrue(any(not torch.equal(initial_gnn[key], gnn_state['policy'][key]) for key in initial_gnn))
             for transition in gnn_state['transitions']:
                 nodes = transition['policy_graph']['face_to_node'][transition['visible']]
                 np.testing.assert_array_equal(transition['policy_graph']['node_to_face'][nodes], transition['visible'])
             for key in gnn_state['policy']:
                 torch.testing.assert_close(gnn_state['policy'][key], gnn_restored['policy'][key])
+            missing_dir = os.path.join(directory, 'gnn_missing_gradient')
+            os.mkdir(missing_dir)
+            missing = make_trainer(missing_dir, ckpt, mesh)
+            missing.opt.refine_policy = 'gnn'
+            missing.opt.refine_multiround_rounds = 1
+            missing.opt.refine_multiround_horizon = 1
+            missing.opt.refine_multiround_grad_weight = 1.
+            refinement_multiround.run_multiround(missing, Dataset(), Dataset(), [0], [1])
+            missing_state = torch.load(os.path.join(missing_dir, 'trajectory.pt'), map_location='cpu')
+            missing_round = missing_state['transitions'][0]
+            self.assertFalse(missing_round['grad_counts'].any())
+            self.assertTrue(np.isnan(missing_round['reward']).all())
+            self.assertIsNone(missing_round['policy_loss'])
             wrong = make_trainer(gnn_resume_dir, ckpt, mesh, os.path.join(gnn_dir, 'trajectory.pt'))
             with self.assertRaisesRegex(ValueError, 'Policy architecture mismatch'):
                 refinement_multiround.run_multiround(wrong, Dataset(), Dataset(), [0], [1])
+            old_gnn = copy.deepcopy(gnn_state)
+            old_gnn['config']['policy_architecture'] = 'face_gnn_two_layer_v1'
+            old_gnn['config'].pop('texture_feature_version')
+            old_gnn_path = os.path.join(directory, 'old_gnn.pt')
+            torch.save(old_gnn, old_gnn_path)
+            wrong_gnn = make_trainer(gnn_resume_dir, ckpt, mesh, old_gnn_path)
+            wrong_gnn.opt.refine_policy = 'gnn'
+            with self.assertRaisesRegex(ValueError, 'retrain from Stage 1'):
+                refinement_multiround.run_multiround(wrong_gnn, Dataset(), Dataset(), [0], [1])
             for transition in full_state['transitions']:
                 with np.load(os.path.join(full_dir, transition['observation_graphs']['after'])) as graph:
                     np.testing.assert_array_equal(graph['parent_face_id'], transition['parent_face_id'])

@@ -9,13 +9,18 @@ from nerf.refinement_candidates import CandidatePolicy
 
 
 POLICY_VERSION = 'face_gnn_two_layer_v1'
+TEXTURE_POLICY_VERSION = 'face_gnn_two_layer_texture_v2'
 GRAPH_KEYS = ('node_features', 'edge_index', 'edge_features', 'edge_feature_valid', 'face_to_node', 'node_to_face')
 
 
 def policy_graph_state(graph):
     """Copy the sampling graph into the trajectory; paths to NPZs are not required."""
     state = {key: np.asarray(graph[key]).copy() for key in GRAPH_KEYS}
+    for key in ('texture_raw', 'texture_valid', 'texture_pixel_count'):
+        if key in graph:
+            state[key] = np.asarray(graph[key]).copy()
     state['edge_length_scale'] = float(np.sqrt(graph['metadata']['candidate_info']['normalization_scales'][0]))
+    state['texture_feature_version'] = graph['metadata'].get('texture_feature_version')
     return state
 
 
@@ -62,3 +67,15 @@ class SparseFacePolicy(CandidatePolicy):
         if np.any(nodes >= len(inverse)) or not np.array_equal(inverse[nodes], ids):
             raise ValueError('Policy graph snapshot has inconsistent face/node mapping')
         return self.score(self.encode(graph)[torch.as_tensor(nodes, dtype=torch.long)], budgets)
+
+
+class TextureFacePolicy(SparseFacePolicy):
+    def __init__(self):
+        super().__init__()
+        self.node_encoder = nn.Linear(12, 32)
+
+    def encode(self, graph):
+        from nerf.refinement_texture import TEXTURE_FEATURE_VERSION
+        if graph.get('texture_feature_version') != TEXTURE_FEATURE_VERSION or graph['node_features'].shape[1] != 13:
+            raise ValueError('Texture GNN requires the matching Sobel graph feature version; retrain incompatible policies')
+        return super().encode(graph)

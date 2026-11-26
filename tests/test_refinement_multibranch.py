@@ -13,7 +13,8 @@ from nerf.refinement_multibranch import (full_frame_metrics, load_trajectory_pol
                                          selection_face_observations)
 from nerf.refinement_rl import FacePolicy, file_sha256
 from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION
-from nerf.refinement_gnn import SparseFacePolicy, POLICY_VERSION
+from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, POLICY_VERSION, TEXTURE_POLICY_VERSION
+from nerf.refinement_texture import TEXTURE_FEATURE_VERSION
 
 
 class MultiBranchTest(unittest.TestCase):
@@ -211,6 +212,27 @@ class MultiBranchTest(unittest.TestCase):
                 self.assertLessEqual(first['round_budget'], paired['per_round_budget'])
                 self.assertLessEqual(second['round_budget'], paired['per_round_budget'])
                 self.assertLessEqual(second['actual_added_faces'], second['round_budget'])
+            texture_path = os.path.join(directory, 'texture.pt')
+            torch.save({'policy': TextureFacePolicy().state_dict(), 'config': {
+                'checkpoint_sha256': file_sha256(checkpoint), 'mesh_sha256': file_sha256(mesh),
+                'feature_version': FEATURE_VERSION, 'policy_type': 'gnn',
+                'policy_architecture': TEXTURE_POLICY_VERSION, 'texture_feature_version': TEXTURE_FEATURE_VERSION}}, texture_path)
+            opt.refine_multibranch_policy = gnn_path
+            opt.refine_multibranch_compare_policy = texture_path
+            model = Model(); trainer.model = model; trainer.global_step = 10; opt.refine = True
+            opt.refine_experiment_output = os.path.join(directory, 'gnn_texture_compare')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                texture_pair = json.load(source)
+            self.assertEqual([branch['policy_architecture'] for branch in texture_pair['branches'][:2]],
+                             [POLICY_VERSION, TEXTURE_POLICY_VERSION])
+            with np.load(texture_pair['branches'][1]['rounds'][0]['observation_graphs']['before']) as recorded:
+                self.assertEqual(recorded['node_features'].shape[1], 13)
+            opt.refine_multibranch_policy = policy_path
+            opt.refine_multibranch_compare_policy = gnn_path
             low_mlp = CandidatePolicy()
             low_gnn = SparseFacePolicy()
             with torch.no_grad():

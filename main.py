@@ -139,6 +139,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_multiround_gamma', type=float, default=0.9, help='lineage return discount')
     parser.add_argument('--refine_multiround_sil_weight', type=float, default=1.0, help='silhouette reward weight')
     parser.add_argument('--refine_multiround_rgb_weight', type=float, default=1.0, help='RGB reward weight')
+    parser.add_argument('--refine_multiround_grad_weight', type=float, default=0.0, help='Sobel gradient-improvement reward weight')
     parser.add_argument('--refine_multiround_face_cost', type=float, default=0.001, help='cost per added face')
     parser.add_argument('--refine_advantage_baseline', choices=['none', 'mean'], default='mean', help='baseline applied to considered valid face returns')
     parser.add_argument('--refine_advantage_scale', choices=['none', 'std'], default='std', help='scale considered valid face advantages by their standard deviation')

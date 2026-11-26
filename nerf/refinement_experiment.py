@@ -29,7 +29,7 @@ def _select_views(total, count, selection=None, evaluation=None, allow_overlap=F
     return selection, evaluation
 
 
-def _observe(trainer, dataset, view_ids):
+def _observe(trainer, dataset, view_ids, texture=False):
     observations = []
     trainer.model.eval()
     with torch.no_grad():
@@ -42,8 +42,14 @@ def _observe(trainer, dataset, view_ids):
             prediction, _, target, _ = trainer.eval_step(data)
             loss = trainer.criterion(prediction, target).mean(-1)
             faces = trainer.model.triangles_errors_id.long()
-            observations.append((faces.cpu().numpy().reshape(-1).copy(),
-                                 loss.cpu().numpy().reshape(-1).copy(), foreground))
+            observation = (faces.cpu().numpy().reshape(-1).copy(),
+                           loss.cpu().numpy().reshape(-1).copy(), foreground)
+            if texture:
+                if images is None or images.shape[-1] != 4:
+                    raise ValueError('Texture observation requires ground-truth RGBA images')
+                from nerf.refinement_texture import sobel_observation
+                observation += sobel_observation(prediction, target, images[..., 3], faces)
+            observations.append(observation)
     return observations
 
 

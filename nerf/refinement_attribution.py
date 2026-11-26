@@ -22,7 +22,8 @@ def _summary(ids, counts, before, after):
             'positive_improvement_fraction': float(np.mean(delta > 0))}
 
 
-def edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after, sil_counts, sil_before, sil_after):
+def edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after, sil_counts, sil_before, sil_after,
+                  grad_counts=None, grad_before=None, grad_after=None):
     requesters = {int(edge['requester_face']) for edge in event['edge_events']}
     affected = {int(face) for edge in event['edge_events'] for face in edge['affected_faces']}
     passive = set(map(int, event['passive_faces']))
@@ -35,22 +36,30 @@ def edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after, sil_coun
                     'before': float(before[face]) if valid else None,
                     'after': float(after[face]) if valid else None,
                     'improvement': float(before[face] - after[face]) if valid else None}
-        return {'face_id': face, 'passively_split': face in passive,
+        record = {'face_id': face, 'passively_split': face in passive,
                 'rgb': metric(rgb_counts, rgb_before, rgb_after),
                 'silhouette': metric(sil_counts, sil_before, sil_after)}
+        if grad_counts is not None:
+            record['gradient'] = metric(grad_counts, grad_before, grad_after)
+        return record
 
     edges = []
     for edge in event['edge_events']:
         faces = set(map(int, edge['affected_faces']))
-        edges.append({'edge': edge['edge'], 'requester_face': int(edge['requester_face']),
+        entry = {'edge': edge['edge'], 'requester_face': int(edge['requester_face']),
                       'added_faces': int(edge['added_faces']),
                       'faces': [face_record(face) for face in sorted(faces)],
                       'combined_rgb': _summary(faces, rgb_counts, rgb_before, rgb_after),
-                      'combined_silhouette': _summary(faces, sil_counts, sil_before, sil_after)})
+                      'combined_silhouette': _summary(faces, sil_counts, sil_before, sil_after)}
+        if grad_counts is not None:
+            entry['combined_gradient'] = _summary(faces, grad_counts, grad_before, grad_after)
+        edges.append(entry)
     groups = {}
     for name, ids in [('executed_requesters', requesters), ('passive_neighbors', passive),
                       ('unchanged_faces', unchanged)]:
         groups[name] = {'rgb': _summary(ids, rgb_counts, rgb_before, rgb_after),
                         'silhouette': _summary(ids, sil_counts, sil_before, sil_after)}
+        if grad_counts is not None:
+            groups[name]['gradient'] = _summary(ids, grad_counts, grad_before, grad_after)
     return {'edges': edges, 'groups': groups,
             'group_definition': 'unchanged_faces means every old face not affected by a split, including unobserved or rejected faces'}

@@ -14,7 +14,8 @@ from nerf.refinement_rl import file_sha256
 from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candidate_features,
                                         remap_vertex_ema, visibility_counts, SequentialFaceDecisions)
 from nerf.refinement_attribution import edge_outcomes
-from nerf.refinement_gnn import SparseFacePolicy, POLICY_VERSION, policy_graph_state
+from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, TEXTURE_POLICY_VERSION, policy_graph_state
+from nerf.refinement_texture import fixed_gradient_regions, TEXTURE_FEATURE_VERSION, TEXTURE_DEFINITION
 
 
 POLICY_OBJECTIVE = 'candidate_sequential_budget_stop_v5'
@@ -29,12 +30,20 @@ def edge_costs(event, face_count):
     return costs
 
 
-def local_rewards(rgb_before, rgb_after, sil_before, sil_after, counts, costs, weights):
+def local_rewards(rgb_before, rgb_after, sil_before, sil_after, counts, costs, weights,
+                  grad_counts=None, grad_before=None, grad_after=None):
     valid = counts > 0
+    grad_weight = weights[3] if len(weights) > 3 else 0.
+    if grad_weight > 0:
+        if grad_counts is None:
+            raise ValueError('Gradient reward requires fixed-region gradient observations')
+        valid = valid & (grad_counts > 0) & np.isfinite(grad_before) & np.isfinite(grad_after)
     reward = np.full(len(counts), np.nan)
     reward[valid] = (weights[0] * (sil_before[valid] - sil_after[valid]) +
                      weights[1] * (rgb_before[valid] - rgb_after[valid]) -
                      weights[2] * costs[valid])
+    if grad_weight > 0:
+        reward[valid] += grad_weight * (grad_before[valid] - grad_after[valid])
     return reward
 
 
@@ -135,8 +144,12 @@ def reward_distributions(transition, weights, returns=None, face_ids=None):
     silhouette = np.where(valid, weights[0] * (transition['sil_before'] - transition['sil_after']), np.nan)
     rgb = np.where(valid, weights[1] * (transition['rgb_before'] - transition['rgb_after']), np.nan)
     cost = np.where(valid, -weights[2] * transition['costs'], np.nan)
+    gradient = np.full(len(valid), np.nan)
+    if 'grad_counts' in transition:
+        gv = valid & (transition['grad_counts'] > 0) & np.isfinite(transition['grad_before']) & np.isfinite(transition['grad_after'])
+        gradient[gv] = (weights[3] if len(weights) > 3 else 0.) * (transition['grad_before'][gv] - transition['grad_after'][gv])
     return {'silhouette': _distribution(silhouette), 'rgb': _distribution(rgb),
-            'face_cost': _distribution(cost), 'local_reward': _distribution(transition['reward']),
+            'gradient': _distribution(gradient), 'face_cost': _distribution(cost), 'local_reward': _distribution(transition['reward']),
             'lineage_return': _distribution([] if returns is None else np.where(valid, returns, np.nan))}
 
 
@@ -171,7 +184,7 @@ def action_counts(transition):
             'already_split_count': statuses.count('already_split')}
 
 
-def _observe_silhouette(trainer, dataset, views, training_dataset=False):
+def _observe_silhouette(trainer, dataset, views, training_dataset=False, texture=False):
     observations = []
     trainer.model.eval()
     with torch.no_grad():
@@ -188,8 +201,11 @@ def _observe_silhouette(trainer, dataset, views, training_dataset=False):
             rgb = trainer.criterion(prediction, target).mean(-1).cpu().numpy().reshape(-1).copy()
             alpha = trainer.model.refinement_alpha.cpu().numpy().reshape(-1).copy()
             faces = trainer.model.triangles_errors_id.long().cpu().numpy().reshape(-1).copy()
-            observations.append((faces, rgb, np.abs(alpha - target_alpha), target_alpha,
-                                 (data['H'], data['W'])))
+            observation = (faces, rgb, np.abs(alpha - target_alpha), target_alpha, (data['H'], data['W']))
+            if texture:
+                from nerf.refinement_texture import sobel_observation
+                observation += sobel_observation(prediction, target, images[..., 3], faces)
+            observations.append(observation)
     return observations
 
 
@@ -249,7 +265,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             opt.refine_face_budget < 1 or opt.refine_multiround_rounds < 1 or horizon < 1 or opt.refine_rl_lr <= 0 or
             not 0 <= opt.refine_multiround_gamma <= 1):
         raise ValueError('Multi-round training requires --refine_rl, positive budget/rounds/lr and gamma in [0,1]')
-    weights = [opt.refine_multiround_sil_weight, opt.refine_multiround_rgb_weight, opt.refine_multiround_face_cost]
+    weights = [opt.refine_multiround_sil_weight, opt.refine_multiround_rgb_weight, opt.refine_multiround_face_cost,
+               getattr(opt, 'refine_multiround_grad_weight', 0.)]
     if any(not np.isfinite(weight) or weight < 0 for weight in weights):
         raise ValueError('Reward weights and face cost must be finite and nonnegative')
     if not np.isfinite(radius) or radius < 0:
@@ -284,7 +301,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'budget_decision_mode': 'area order, sequential remaining/per-round budget, stop sampling at zero',
               'feature_version': FEATURE_VERSION,
               'policy_type': policy_type,
-              'policy_architecture': POLICY_VERSION if policy_type == 'gnn' else 'candidate_mlp_v1',
+              'policy_architecture': TEXTURE_POLICY_VERSION if policy_type == 'gnn' else 'candidate_mlp_v1',
+              'texture_feature_version': TEXTURE_FEATURE_VERSION if policy_type == 'gnn' else None,
+              'texture_definition': TEXTURE_DEFINITION if policy_type == 'gnn' or weights[3] > 0 else None,
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
               'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
@@ -295,7 +314,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         config['stage1_depth_source'] = Stage1DepthSource(opt.stage1_depth_manifest).describe()
     model = trainer.model
     torch.manual_seed(opt.seed)
-    policy = SparseFacePolicy() if policy_type == 'gnn' else CandidatePolicy()
+    policy = TextureFacePolicy() if policy_type == 'gnn' else CandidatePolicy()
     optimizer = torch.optim.Adam(policy.parameters(), lr=opt.refine_rl_lr)
     generator = torch.Generator().manual_seed(opt.seed)
     transitions = []
@@ -310,14 +329,26 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         saved = torch.load(opt.refine_multiround_resume, map_location='cpu')
         old_config = dict(saved['config'])
         requested_config = dict(config)
+        old_texture_version = old_config.pop('texture_feature_version', None)
+        requested_texture_version = requested_config.pop('texture_feature_version')
+        old_config.pop('texture_definition', None)
+        requested_config.pop('texture_definition')
+        if len(old_config.get('weights', [])) == 3 and weights[3] == 0:
+            old_config['weights'] = list(old_config['weights']) + [0.]
         old_policy_type = old_config.pop('policy_type', 'mlp')
         requested_config.pop('policy_type')
         old_architecture = old_config.pop('policy_architecture', 'candidate_mlp_v1')
         requested_architecture = requested_config.pop('policy_architecture')
         if old_policy_type != policy_type or old_architecture != requested_architecture:
+            if old_policy_type == policy_type == 'gnn':
+                raise ValueError('GNN architecture/feature version mismatch; old GNN weights cannot be resumed as a texture GNN, retrain from Stage 1')
             raise ValueError('Policy architecture mismatch: checkpoint is {}, requested {}'.format(old_policy_type, policy_type))
+        if old_texture_version != requested_texture_version:
+            raise ValueError('Texture feature version mismatch: old GNN checkpoint cannot resume; retrain the texture GNN')
         old_options = dict(old_config.get('options', {}))
         requested_options = dict(requested_config.get('options', {}))
+        if 'refine_multiround_grad_weight' not in old_options and weights[3] == 0:
+            requested_options.pop('refine_multiround_grad_weight', None)
         # Graph recording does not change the policy or the optimization trajectory.
         for key in ('refine_multibranch_policy_mode',):
             old_options.pop(key, None)
@@ -454,8 +485,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     target_round = min(horizon, len(transitions) + opt.refine_multiround_rounds)
     for t in range(len(transitions), target_round):
         count = len(model.triangles)
-        selection = _observe(trainer, val_data, selection_views)
-        before = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
+        use_texture = policy_type == 'gnn'
+        observe_gradient_reward = use_texture or weights[3] > 0
+        selection = _observe(trainer, val_data, selection_views, texture=use_texture)
+        before = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True, texture=observe_gradient_reward)
         evaluation_before = _observe_silhouette(trainer, val_data, evaluation_views)
         sums, observations, view_counts = visibility_counts(selection, count)
         model.triangles_errors = torch.tensor(sums, dtype=torch.float32, device=trainer.device)
@@ -471,6 +504,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                 opt.refine_face_budget, opt.refine_face_budget, candidate_fraction, min_area,
                 getattr(opt, 'refine_graph_self_loops', False))
             if policy_type == 'gnn':
+                from nerf.refinement_graph import add_texture_features
+                add_texture_features(graph, selection)
                 graph_state = policy_graph_state(graph)
             if getattr(opt, 'refine_observation_graph', False):
                 graph['metadata']['policy'] = 'shared ' + policy_type + ' policy'
@@ -500,22 +535,30 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         indices = np.random.RandomState(step_seed).choice(len(train_data.poses), opt.refine_experiment_steps).tolist()
         training_losses = _train_branch(trainer, train_data, indices, step_seed, vertex_state, ema_beta)
         if graph_files is not None:
-            updated_selection = _observe(trainer, val_data, selection_views)
+            updated_selection = _observe(trainer, val_data, selection_views, texture=use_texture)
             updated_sums, updated_pixels, updated_views = visibility_counts(updated_selection, len(model.triangles))
             updated_graph, _, _, _ = build_face_graph(
                 (model.vertices + model.vertices_offsets.detach()).cpu().numpy(), model.triangles.cpu().numpy(),
                 updated_sums, updated_pixels, updated_views, len(selection_views), vertex_state['ema'],
                 vertex_state['seen'], opt.refine_face_budget - event['added_faces'], opt.refine_face_budget,
                 candidate_fraction, min_area, getattr(opt, 'refine_graph_self_loops', False))
+            if use_texture:
+                add_texture_features(updated_graph, updated_selection)
             updated_graph['metadata']['policy'] = 'shared ' + policy_type + ' policy'
             save_face_graph(graph_files['after'], updated_graph, parents)
-        after = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True)
+        after = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True, texture=observe_gradient_reward)
         evaluation_after = _observe_silhouette(trainer, val_data, evaluation_views)
         pixel_counts, rgb_before, rgb_after = _region_stats(before, after, count, 1)
         sil_counts, sil_before, sil_after = _region_stats(before, after, count, 2, radius)
-        rewards = local_rewards(rgb_before, rgb_after, sil_before, sil_after, pixel_counts, costs, weights)
+        if observe_gradient_reward:
+            grad_counts, grad_before, grad_after = fixed_gradient_regions(before, after, count)
+        else:
+            grad_counts = np.zeros(count, dtype=np.int64)
+            grad_before = grad_after = np.full(count, np.nan)
+        rewards = local_rewards(rgb_before, rgb_after, sil_before, sil_after, pixel_counts, costs, weights,
+                                grad_counts, grad_before, grad_after)
         outcomes = edge_outcomes(event, count, pixel_counts, rgb_before, rgb_after,
-                                 sil_counts, sil_before, sil_after)
+                                 sil_counts, sil_before, sil_after, grad_counts, grad_before, grad_after)
         child_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
         child_areas = _areas(child_vertices, model.triangles.cpu().numpy())
         _, eval_rgb_before, eval_rgb_after = _region_stats(evaluation_before, evaluation_after, count, 1)
@@ -543,6 +586,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                             'parent_face_id': parents, 'child_areas': child_areas, 'costs': costs,
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
                             'sil_before': sil_before, 'sil_after': sil_after, 'reward': rewards,
+                            'grad_counts': grad_counts, 'grad_before': grad_before, 'grad_after': grad_after,
                             'edge_outcomes': outcomes,
                             'evaluation': evaluation})
         snapshot(False)
@@ -574,6 +618,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'silhouette_pixels': transition['silhouette_pixels'].tolist(),
                       'rgb_before': _json_values(transition['rgb_before']), 'rgb_after': _json_values(transition['rgb_after']),
                       'sil_before': _json_values(transition['sil_before']), 'sil_after': _json_values(transition['sil_after']),
+                      'grad_pixels': transition.get('grad_counts', np.zeros_like(transition['reward_pixels'])).tolist(),
+                      'grad_before': _json_values(transition.get('grad_before', np.full_like(transition['rgb_before'], np.nan))),
+                      'grad_after': _json_values(transition.get('grad_after', np.full_like(transition['rgb_after'], np.nan))),
                       'local_reward': _json_values(transition['reward']), 'lineage_return': None,
                       'reward_distributions': reward_distributions(transition, weights),
                       'reward_groups': grouped_rewards(transition, weights),
@@ -641,6 +688,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'silhouette_pixels': transition['silhouette_pixels'].tolist(),
                   'rgb_before': _json_values(transition['rgb_before']), 'rgb_after': _json_values(transition['rgb_after']),
                   'sil_before': _json_values(transition['sil_before']), 'sil_after': _json_values(transition['sil_after']),
+                  'grad_pixels': transition.get('grad_counts', np.zeros_like(transition['reward_pixels'])).tolist(),
+                  'grad_before': _json_values(transition.get('grad_before', np.full_like(transition['rgb_before'], np.nan))),
+                  'grad_after': _json_values(transition.get('grad_after', np.full_like(transition['rgb_after'], np.nan))),
                   'local_reward': _json_values(transition['reward']), 'lineage_return': _json_values(values)}
         record.update(action_counts(transition))
         with open(os.path.join(opt.refine_experiment_output, 'round_{:04d}.json'.format(transition['round'])), 'w') as output:

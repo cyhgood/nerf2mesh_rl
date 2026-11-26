@@ -15,7 +15,8 @@ from nerf.refinement_rl import FacePolicy, face_features, file_sha256
 from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, SequentialFaceDecisions, RankedFaceDecisions,
                                         candidate_features, remap_vertex_ema, visibility_counts)
 from nerf.refinement_attribution import edge_outcomes
-from nerf.refinement_gnn import SparseFacePolicy, POLICY_VERSION, policy_graph_state
+from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, POLICY_VERSION, TEXTURE_POLICY_VERSION, policy_graph_state
+from nerf.refinement_texture import TEXTURE_FEATURE_VERSION, fixed_gradient_regions, texture_face_sums
 
 
 def probability_distribution(values):
@@ -39,9 +40,12 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
     if kind not in ('mlp', 'gnn'):
         raise ValueError('Unknown policy architecture in trajectory: {}'.format(kind))
     if kind == 'gnn':
-        if config.get('policy_architecture') != POLICY_VERSION or config.get('feature_version') != FEATURE_VERSION:
+        architecture = config.get('policy_architecture')
+        if architecture not in (POLICY_VERSION, TEXTURE_POLICY_VERSION) or config.get('feature_version') != FEATURE_VERSION:
             raise ValueError('GNN checkpoint architecture or feature version mismatch')
-        policy = SparseFacePolicy()
+        if architecture == TEXTURE_POLICY_VERSION and config.get('texture_feature_version') != TEXTURE_FEATURE_VERSION:
+            raise ValueError('Texture GNN feature version mismatch; retrain a compatible policy')
+        policy = TextureFacePolicy() if architecture == TEXTURE_POLICY_VERSION else SparseFacePolicy()
     else:
         if config.get('policy_architecture', 'candidate_mlp_v1') != 'candidate_mlp_v1':
             raise ValueError('MLP checkpoint architecture mismatch')
@@ -107,7 +111,8 @@ def selection_face_observations(observations, face_count, vertices, faces, radiu
     near_counts = np.zeros(face_count, dtype=np.int64)
     min_distance = np.full(face_count, np.inf)
     contour_views = 0
-    for face_ids, losses, _, target_alpha, shape in observations:
+    for observation in observations:
+        face_ids, losses, _, target_alpha, shape = observation[:5]
         valid = face_ids >= 0
         sums += np.bincount(face_ids[valid], weights=losses[valid], minlength=face_count)
         counts += np.bincount(face_ids[valid], minlength=face_count)
@@ -161,14 +166,16 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     comparison_policy = load_trajectory_policy(comparison_path, checkpoint_hash, mesh_hash) if comparison_path else None
     if comparison_policy is not None:
         if (not isinstance(policy, CandidatePolicy) or not isinstance(comparison_policy, CandidatePolicy) or
-                isinstance(policy, SparseFacePolicy) == isinstance(comparison_policy, SparseFacePolicy)):
-            raise ValueError('Policy comparison requires one current MLP and one GNN trajectory')
+                type(policy) == type(comparison_policy)):
+            raise ValueError('Policy comparison requires two different current policy architectures')
         for key in ('fraction', 'min_area', 'ema_beta'):
             if policy.candidate_settings[key] != comparison_policy.candidate_settings[key]:
                 raise ValueError('MLP and GNN candidate/EMA settings must match: ' + key)
     if getattr(opt, 'refine_observation_graph', False) and not isinstance(policy, CandidatePolicy):
         raise ValueError('Observation graph recording requires the current CandidatePolicy checkpoint')
     initial_policy = copy.deepcopy(policy.state_dict())
+    use_texture_observation = (isinstance(policy, TextureFacePolicy) or isinstance(comparison_policy, TextureFacePolicy) or
+                               getattr(opt, 'refine_multiround_grad_weight', 0.) > 0)
     comparison_initial = copy.deepcopy(comparison_policy.state_dict()) if comparison_policy is not None else None
     model = trainer.model
     warmup_steps = getattr(opt, 'refine_gradient_ema_warmup_steps', 0)
@@ -226,7 +233,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
               'optimization_steps': opt.refine_experiment_steps,
               'selection_region_reward_weights': [getattr(opt, 'refine_multiround_sil_weight', 1.0),
                                                   getattr(opt, 'refine_multiround_rgb_weight', 1.0),
-                                                  getattr(opt, 'refine_multiround_face_cost', 0.001)],
+                                                  getattr(opt, 'refine_multiround_face_cost', 0.001),
+                                                  getattr(opt, 'refine_multiround_grad_weight', 0.)],
               'selection_region_reward_note': 'local reward on pre-split selection-view regions; no policy updates or lineage return in evaluation',
               'training_indices': training_indices, 'training_seeds': training_seeds,
               'policy_evaluation_mode': policy_mode,
@@ -259,6 +267,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         branch = {'method': method, 'random_seed': random_seed,
                   'policy_evaluation_mode': (policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
                   'policy_type': ('gnn' if isinstance(policy, SparseFacePolicy) else 'mlp') if is_rl else None,
+                  'policy_architecture': (TEXTURE_POLICY_VERSION if isinstance(policy, TextureFacePolicy) else POLICY_VERSION if isinstance(policy, SparseFacePolicy) else 'candidate_mlp_v1') if is_rl else None,
                   'policy_training_reward_weights': getattr(policy, 'training_reward_weights', None) if is_rl else None,
                   'initial_faces': len(model.triangles), 'initial_global_step': trainer.global_step,
                   'initial_metrics': initial_metrics, 'rounds': []}
@@ -267,7 +276,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         branch_name = '{}_{}'.format(method, random_seed) if random_seed is not None else method
         for round_index in range(opt.refine_multibranch_rounds):
             face_count = len(model.triangles)
-            observations = _observe_silhouette(trainer, val_data, selection_views)
+            observations = _observe_silhouette(trainer, val_data, selection_views, texture=use_texture_observation)
             vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
             faces = model.triangles.cpu().numpy()
             sums, counts, means, areas, near_counts, min_distance, contour_views = selection_face_observations(
@@ -295,6 +304,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                             policy.candidate_settings['fraction'], policy.candidate_settings['min_area'],
                             policy.candidate_settings['self_loops'] if isinstance(policy, SparseFacePolicy) else getattr(opt, 'refine_graph_self_loops', False))
                         if isinstance(policy, SparseFacePolicy):
+                            if isinstance(policy, TextureFacePolicy):
+                                from nerf.refinement_graph import add_texture_features
+                                add_texture_features(graph, observations)
                             graph_state = policy_graph_state(graph)
                         if getattr(opt, 'refine_observation_graph', False):
                             graph['metadata']['policy'] = 'shared ' + ('gnn' if isinstance(policy, SparseFacePolicy) else 'mlp') + ' policy'
@@ -360,7 +372,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             training_losses = _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
                           vertex_state if is_rl and isinstance(policy, CandidatePolicy) else None,
                           policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
-            after_selection = _observe_silhouette(trainer, val_data, selection_views)
+            after_selection = _observe_silhouette(trainer, val_data, selection_views, texture=use_texture_observation)
             if graph_files is not None:
                 post_sums, post_pixels, post_views = visibility_counts(after_selection, len(model.triangles))
                 post_graph, _, _, _ = build_face_graph(
@@ -368,16 +380,26 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                     post_sums, post_pixels, post_views, len(selection_views), vertex_state['ema'], vertex_state['seen'],
                     round_budget - actual, round_budget, policy.candidate_settings['fraction'],
                     policy.candidate_settings['min_area'], policy.candidate_settings['self_loops'] if isinstance(policy, SparseFacePolicy) else getattr(opt, 'refine_graph_self_loops', False))
+                if isinstance(policy, TextureFacePolicy):
+                    add_texture_features(post_graph, after_selection)
                 post_graph['metadata']['policy'] = 'shared ' + ('gnn' if isinstance(policy, SparseFacePolicy) else 'mlp') + ' policy'
                 save_face_graph(graph_files['after'], post_graph,
                                 model.parent_face_id.cpu().numpy())
             rgb_counts, rgb_before, rgb_after = _region_stats(observations, after_selection, face_count, 1)
             sil_counts, sil_before, sil_after = _region_stats(observations, after_selection, face_count, 2, contour_radius)
+            if use_texture_observation:
+                grad_counts, grad_before, grad_after = fixed_gradient_regions(observations, after_selection, face_count)
+                texture_sum, texture_error_sum, texture_counts = texture_face_sums(observations, face_count)
+            else:
+                grad_counts = np.zeros(face_count, dtype=np.int64)
+                grad_before = grad_after = np.full(face_count, np.nan)
+                texture_sum = texture_error_sum = np.zeros(face_count)
+                texture_counts = np.zeros(face_count, dtype=np.int64)
             outcomes = edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after,
-                                     sil_counts, sil_before, sil_after)
+                                     sil_counts, sil_before, sil_after, grad_counts, grad_before, grad_after)
             face_cost = edge_costs(event, face_count)
             face_reward = local_rewards(rgb_before, rgb_after, sil_before, sil_after, rgb_counts, face_cost,
-                                        result['selection_region_reward_weights'])
+                                        result['selection_region_reward_weights'], grad_counts, grad_before, grad_after)
             np.savez_compressed(os.path.join(opt.refine_experiment_output, observations_file),
                                 face_id=np.arange(face_count), rgb_mean=means, visible_pixels=counts,
                                 area=areas, contour_near_pixels=near_counts,
@@ -392,7 +414,10 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                 decision_log_probability=decisions.log_probabilities if decisions is not None else np.array([], dtype=np.float64),
                                 rgb_evaluation_pixels=rgb_counts, rgb_before=rgb_before, rgb_after=rgb_after,
                                 silhouette_evaluation_pixels=sil_counts, silhouette_before=sil_before, silhouette_after=sil_after,
-                                face_cost=face_cost, selection_region_local_reward=face_reward)
+                                face_cost=face_cost, selection_region_local_reward=face_reward,
+                                gradient_pixels=grad_counts, gradient_before=grad_before, gradient_after=grad_after,
+                                texture_strength_sum=texture_sum, texture_error_sum=texture_error_sum,
+                                texture_pixels=texture_counts)
             metrics = full_frame_metrics(_observe_silhouette(trainer, val_data, evaluation_views),
                                          evaluation_views, shapes)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,

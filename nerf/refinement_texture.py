@@ -1,0 +1,73 @@
+"""Sobel observations and fixed pre-split face-region gradient statistics."""
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+TEXTURE_FEATURE_VERSION = 'sobel_foreground_rgb_v1'
+TEXTURE_DEFINITION = ('eval RGB color_space; fixed white compositing; Sobel / 8; per-pixel '
+                      'sqrt(mean_RGB(gx^2+gy^2)); SmoothL1 mean over RGB and xy; '
+                      'valid only if 3x3 target alpha >= .999 and RGB finite, '
+                      'image boundary excluded; selection additionally requires 3x3 mesh coverage')
+
+
+def sobel_observation(prediction, target, alpha, face_ids):
+    prediction = torch.as_tensor(prediction).float()
+    target = torch.as_tensor(target, device=prediction.device).float()
+    alpha = torch.as_tensor(alpha, device=prediction.device).float()
+    face_ids = torch.as_tensor(face_ids, device=prediction.device)
+    if prediction.ndim != 3 or prediction.shape[-1] != 3 or target.shape != prediction.shape:
+        raise ValueError('Sobel requires matching H x W x 3 images')
+    h, w = prediction.shape[:2]
+    alpha, face_ids = alpha.reshape(h, w), face_ids.reshape(h, w)
+    finite = torch.isfinite(prediction).all(-1) & torch.isfinite(target).all(-1) & torch.isfinite(alpha)
+    foreground = finite & (alpha >= .999)
+    coverage = foreground & (face_ids >= 0)
+    def stencil(mask):
+        value = F.conv2d(mask.float()[None, None], torch.ones((1, 1, 3, 3), device=mask.device), padding=1)
+        return value[0, 0] == 9
+    pred = torch.nan_to_num(prediction).permute(2, 0, 1)[None]
+    gt = torch.nan_to_num(target).permute(2, 0, 1)[None]
+    kernel = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=pred.device) / 8
+    filters = torch.stack((kernel, kernel.T)).unsqueeze(1).repeat(3, 1, 1, 1)
+    grad_pred = F.conv2d(F.pad(pred, (1, 1, 1, 1), mode='replicate'), filters, groups=3)
+    grad_gt = F.conv2d(F.pad(gt, (1, 1, 1, 1), mode='replicate'), filters, groups=3)
+    strength = grad_gt.reshape(1, 3, 2, h, w).square().sum(2).mean(1).sqrt()[0]
+    error = F.smooth_l1_loss(grad_pred, grad_gt, reduction='none').mean(1)[0]
+    return tuple(x.detach().cpu().numpy().reshape(-1).copy() for x in
+                 (strength, error, stencil(foreground), stencil(coverage)))
+
+
+def texture_face_sums(observations, face_count):
+    strength = np.zeros(face_count, dtype=np.float64)
+    error = np.zeros(face_count, dtype=np.float64)
+    counts = np.zeros(face_count, dtype=np.int64)
+    for item in observations:
+        face, t, e, _, covered = item[0], *item[-4:]
+        valid = covered & (face >= 0) & np.isfinite(t) & np.isfinite(e)
+        counts += np.bincount(face[valid], minlength=face_count)
+        strength += np.bincount(face[valid], weights=t[valid], minlength=face_count)
+        error += np.bincount(face[valid], weights=e[valid], minlength=face_count)
+    return strength, error, counts
+
+
+def fixed_gradient_regions(before, after, face_count):
+    if len(before) != len(after):
+        raise ValueError('Gradient reward requires the same before and after views')
+    counts = np.zeros(face_count, dtype=np.int64)
+    sums_before = np.zeros(face_count, dtype=np.float64)
+    sums_after = np.zeros(face_count, dtype=np.float64)
+    for old, new in zip(before, after):
+        if len(old[0]) != len(new[0]):
+            raise ValueError('Gradient reward requires the same image dimensions')
+        face = old[0]
+        old_error, covered = old[-3], old[-1]
+        new_error, new_finite_fg = new[-3], new[-2]
+        valid = covered & new_finite_fg & (face >= 0) & np.isfinite(old_error) & np.isfinite(new_error)
+        counts += np.bincount(face[valid], minlength=face_count)
+        sums_before += np.bincount(face[valid], weights=old_error[valid], minlength=face_count)
+        sums_after += np.bincount(face[valid], weights=new_error[valid], minlength=face_count)
+    first = np.full(face_count, np.nan)
+    last = np.full(face_count, np.nan)
+    np.divide(sums_before, counts, out=first, where=counts > 0)
+    np.divide(sums_after, counts, out=last, where=counts > 0)
+    return counts, first, last
