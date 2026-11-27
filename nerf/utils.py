@@ -30,7 +30,8 @@ from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
 import lpips
-from nerf.silhouette_loss import stage1_silhouette_loss
+from nerf.silhouette_loss import stage1_silhouette_loss, stage1_foreground_alpha
+from nerf.refinement_texture import stage1_image_gradient_loss
 from nerf.stage1_depth import Stage1DepthSource, stage1_depth_loss
 
 def custom_meshgrid(*args):
@@ -633,6 +634,9 @@ class Trainer(object):
         self.loss_sil = None
         self.loss_stage1_depth = None
         self.stage1_depth_valid_count = None
+        self.loss_image_grad = None
+        self.weighted_loss_image_grad = None
+        self.image_grad_valid_pixels = None
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         index = data['index'] # [1/N]
@@ -741,6 +745,23 @@ class Trainer(object):
                     loss = loss + self.opt.lambda_specular * (specs ** 2).sum(-1).mean()
  
         if self.opt.stage == 1:
+            lambda_image_grad = getattr(self.opt, 'lambda_image_grad', 0.0)
+            if lambda_image_grad > 0:
+                foreground = stage1_foreground_alpha(images, data, (H, W), pred_rgb.device)
+                # Undo the random-background composite using the attached AA alpha.
+                # The result is exactly the same rendering on a fixed white background.
+                alpha = outputs['alpha'].reshape(-1, 1)
+                prediction_white = pred_rgb.reshape(-1, 3) + (1 - alpha) * (1 - bg_color)
+                if C == 4:
+                    target_white = images[..., :3] * images[..., 3:] + (1 - images[..., 3:])
+                else:
+                    target_white = images[..., :3]
+                loss_image_grad, valid_pixels = stage1_image_gradient_loss(
+                    prediction_white.reshape(H, W, 3), target_white.reshape(H, W, 3), foreground)
+                self.loss_image_grad = loss_image_grad.detach()
+                self.weighted_loss_image_grad = (lambda_image_grad * loss_image_grad).detach()
+                self.image_grad_valid_pixels = valid_pixels
+                loss = loss + lambda_image_grad * loss_image_grad
             if getattr(self.opt, 'lambda_stage1_depth', 0) > 0:
                 loss_depth, valid_count = stage1_depth_loss(outputs['surface_depth'], outputs['surface_depth_hit'], target_depth, target_valid)
                 self.loss_stage1_depth = loss_depth.detach()
@@ -1192,6 +1213,10 @@ class Trainer(object):
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     if self.loss_sil is not None:
                         self.writer.add_scalar("train/loss_sil", self.loss_sil.item(), self.global_step)
+                    if self.loss_image_grad is not None:
+                        self.writer.add_scalar("train/loss_image_grad", self.loss_image_grad.item(), self.global_step)
+                        self.writer.add_scalar("train/weighted_loss_image_grad", self.weighted_loss_image_grad.item(), self.global_step)
+                        self.writer.add_scalar("train/image_grad_valid_pixels", self.image_grad_valid_pixels, self.global_step)
                     if self.loss_stage1_depth is not None:
                         self.writer.add_scalar("train/loss_stage1_depth", self.loss_stage1_depth.item(), self.global_step)
                         self.writer.add_scalar("train/stage1_depth_valid_pixels", self.stage1_depth_valid_count, self.global_step)

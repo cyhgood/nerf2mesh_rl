@@ -109,6 +109,9 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
     silhouette_losses = []
     depth_losses = []
     depth_valid_pixels = []
+    image_gradient_losses = []
+    weighted_image_gradient_losses = []
+    image_gradient_valid_pixels = []
     for index in indices:
         trainer.global_step += 1
         trainer.optimizer.zero_grad()
@@ -118,6 +121,10 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
         if getattr(trainer, 'loss_stage1_depth', None) is not None:
             depth_losses.append(float(trainer.loss_stage1_depth.item()))
             depth_valid_pixels.append(trainer.stage1_depth_valid_count)
+        if getattr(trainer, 'loss_image_grad', None) is not None:
+            image_gradient_losses.append(float(trainer.loss_image_grad.item()))
+            weighted_image_gradient_losses.append(float(trainer.weighted_loss_image_grad.item()))
+            image_gradient_valid_pixels.append(trainer.image_grad_valid_pixels)
         trainer.scaler.scale(loss).backward()
         trainer.post_train_step()
         norms = None
@@ -142,7 +149,12 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
     return {'loss_sil_steps': silhouette_losses,
             'loss_sil_mean': float(np.mean(silhouette_losses)) if silhouette_losses else None,
             'loss_depth_steps': depth_losses, 'depth_valid_pixels': depth_valid_pixels,
-            'loss_depth_mean': float(np.mean(depth_losses)) if depth_losses else None}
+            'loss_depth_mean': float(np.mean(depth_losses)) if depth_losses else None,
+            'loss_image_grad_steps': image_gradient_losses,
+            'weighted_loss_image_grad_steps': weighted_image_gradient_losses,
+            'image_grad_valid_pixels': image_gradient_valid_pixels,
+            'loss_image_grad_mean': float(np.mean(image_gradient_losses)) if image_gradient_losses else None,
+            'weighted_loss_image_grad_mean': float(np.mean(weighted_image_gradient_losses)) if weighted_image_gradient_losses else None}
 
 
 def _warmup_vertex_ema(trainer, dataset, vertex_state, steps, beta, seed):

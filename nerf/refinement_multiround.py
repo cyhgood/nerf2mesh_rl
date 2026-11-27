@@ -467,6 +467,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             # A new segment may intentionally use a different mesh loss.
             old_options.pop('lambda_sil', None)
             requested_options.pop('lambda_sil', None)
+            old_options.pop('lambda_image_grad', None)
+            requested_options.pop('lambda_image_grad', None)
             for key in ('lambda_stage1_depth', 'stage1_depth_manifest'):
                 old_options.pop(key, None)
                 requested_options.pop(key, None)
@@ -474,6 +476,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             requested_config.pop('stage1_depth_source', None)
         elif 'lambda_sil' not in old_options and requested_options.get('lambda_sil', 0) == 0:
             requested_options.pop('lambda_sil', None)
+        if not saved['completed'] and 'lambda_image_grad' not in old_options and requested_options.get('lambda_image_grad', 0) == 0:
+            requested_options.pop('lambda_image_grad', None)
         if not saved['completed'] and 'lambda_stage1_depth' not in old_options and requested_options.get('lambda_stage1_depth', 0) == 0:
             requested_options.pop('lambda_stage1_depth', None)
             if not requested_options.get('stage1_depth_manifest', ''):

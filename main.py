@@ -85,6 +85,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_lpips', type=float, default=0, help="loss scale")
     parser.add_argument('--lambda_offsets', type=float, default=0.1, help="loss scale")#顶点偏移L2正则化
     parser.add_argument('--lambda_sil', type=float, default=0, help='Stage 1 full-image silhouette L1 loss weight')
+    parser.add_argument('--lambda_image_grad', type=float, default=0, help='Stage 1 foreground image Sobel gradient loss weight')
     parser.add_argument('--lambda_stage1_depth', type=float, default=0, help='Stage 1 valid surface depth L1 weight (default disabled)')
     parser.add_argument('--stage1_depth_manifest', default='', help='explicit training-view float NPY depth manifest')
     parser.add_argument('--lambda_lap', type=float, default=0.001, help="loss scale")#拉普拉斯平滑损失
@@ -172,6 +173,11 @@ if __name__ == '__main__':
     parser.add_argument('--max_spp', type=int, default=1, help="GUI rendering max sample per pixel")
 
     opt = parser.parse_args()
+
+    if not math.isfinite(opt.lambda_image_grad) or opt.lambda_image_grad < 0:
+        parser.error('--lambda_image_grad must be finite and nonnegative')
+    if opt.lambda_image_grad > 0 and opt.stage != 1:
+        parser.error('--lambda_image_grad requires --stage 1')
 
     if not math.isfinite(opt.lambda_stage1_depth) or opt.lambda_stage1_depth < 0:
         parser.error('--lambda_stage1_depth must be finite and nonnegative')

@@ -26,28 +26,42 @@ def target_sobel_mask(target, alpha):
     return _full_stencil(valid).detach().cpu().numpy().reshape(-1).copy()
 
 
-def sobel_observation(prediction, target, alpha, face_ids):
+def sobel_tensors(prediction, target, alpha, face_ids=None):
+    """Differentiable Sobel maps and valid masks, in the caller's RGB color space."""
     prediction = torch.as_tensor(prediction).float()
     target = torch.as_tensor(target, device=prediction.device).float()
     alpha = torch.as_tensor(alpha, device=prediction.device).float()
-    face_ids = torch.as_tensor(face_ids, device=prediction.device)
     if prediction.ndim != 3 or prediction.shape[-1] != 3 or target.shape != prediction.shape:
         raise ValueError('Sobel requires matching H x W x 3 images')
     h, w = prediction.shape[:2]
-    alpha, face_ids = alpha.reshape(h, w), face_ids.reshape(h, w)
+    alpha = alpha.reshape(h, w)
     finite = torch.isfinite(prediction).all(-1) & torch.isfinite(target).all(-1) & torch.isfinite(alpha)
     foreground = finite & (alpha >= .999)
-    coverage = foreground & (face_ids >= 0)
-    pred = torch.nan_to_num(prediction).permute(2, 0, 1)[None]
-    gt = torch.nan_to_num(target).permute(2, 0, 1)[None]
+    coverage = foreground if face_ids is None else foreground & (torch.as_tensor(face_ids, device=prediction.device).reshape(h, w) >= 0)
+    pred = torch.where(torch.isfinite(prediction), prediction, torch.zeros_like(prediction)).permute(2, 0, 1)[None]
+    gt = torch.where(torch.isfinite(target), target, torch.zeros_like(target)).permute(2, 0, 1)[None]
     kernel = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=pred.device) / 8
     filters = torch.stack((kernel, kernel.T)).unsqueeze(1).repeat(3, 1, 1, 1)
     grad_pred = F.conv2d(F.pad(pred, (1, 1, 1, 1), mode='replicate'), filters, groups=3)
     grad_gt = F.conv2d(F.pad(gt, (1, 1, 1, 1), mode='replicate'), filters, groups=3)
     strength = grad_gt.reshape(1, 3, 2, h, w).square().sum(2).mean(1).sqrt()[0]
     error = F.smooth_l1_loss(grad_pred, grad_gt, reduction='none').mean(1)[0]
-    return tuple(x.detach().cpu().numpy().reshape(-1).copy() for x in
-                 (strength, error, _full_stencil(foreground), _full_stencil(coverage)))
+    return strength, error, _full_stencil(foreground), _full_stencil(coverage)
+
+
+def sobel_observation(prediction, target, alpha, face_ids):
+    return tuple(x.detach().cpu().numpy().reshape(-1).copy()
+                 for x in sobel_tensors(prediction, target, alpha, face_ids))
+
+
+def stage1_image_gradient_loss(prediction, target, alpha):
+    """Mean six-channel Sobel SmoothL1 over finite opaque target stencils."""
+    _, error, valid, _ = sobel_tensors(prediction, target, alpha)
+    count = int(valid.sum().item())
+    if count:
+        return error[valid].mean(), count
+    safe = torch.where(torch.isfinite(prediction), prediction, torch.zeros_like(prediction))
+    return safe.reshape(-1)[:1].sum() * 0., 0
 
 
 def texture_face_sums(observations, face_count):

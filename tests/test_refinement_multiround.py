@@ -266,6 +266,7 @@ class MultiRoundTest(unittest.TestCase):
                     refinement_multiround.run_multiround(interrupted, Dataset(), Dataset(), [0], [1])
             resumed = make_trainer(resumed_dir, ckpt, mesh, os.path.join(interrupted_dir, 'trajectory.pt'))
             resumed.opt.refine_observation_graph = True
+            resumed.opt.lambda_image_grad = 0.
             refinement_multiround.run_multiround(resumed, Dataset(), Dataset(), [0], [1])
             full_state = torch.load(os.path.join(full_dir, 'trajectory.pt'), map_location='cpu')
             resumed_state = torch.load(os.path.join(resumed_dir, 'trajectory.pt'), map_location='cpu')
@@ -371,6 +372,7 @@ class MultiRoundTest(unittest.TestCase):
             continued.opt.refine_multiround_rounds = 1
             # A completed old checkpoint can start a new segment with silhouette supervision.
             continued.opt.lambda_sil = .25
+            continued.opt.lambda_image_grad = .1
             refinement_multiround.run_multiround(continued, Dataset(), Dataset(), [0], [1])
             continued_state = torch.load(os.path.join(continued_dir, 'trajectory.pt'), map_location='cpu')
             self.assertEqual(continued_state['global_step'], 4)
@@ -443,6 +445,11 @@ class MultiRoundTest(unittest.TestCase):
             changed_loss.opt.lambda_sil = .25
             with self.assertRaisesRegex(ValueError, 'configuration or input file hashes differ'):
                 refinement_multiround.run_multiround(changed_loss, Dataset(), Dataset(), [0], [1])
+            changed_gradient = make_trainer(paths[2], ckpt, mesh, os.path.join(paths[1], 'trajectory.pt'))
+            changed_gradient.opt.refine_multiround_horizon = 6
+            changed_gradient.opt.lambda_image_grad = .1
+            with self.assertRaisesRegex(ValueError, 'configuration or input file hashes differ'):
+                refinement_multiround.run_multiround(changed_gradient, Dataset(), Dataset(), [0], [1])
             old_open = copy.deepcopy(pending)
             old_open['config']['policy_objective'] = 'candidate_sequential_budget_v4'
             old_open_path = os.path.join(directory, 'old_dynamic_open.pt')

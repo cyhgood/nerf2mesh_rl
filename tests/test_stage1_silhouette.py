@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from nerf.silhouette_loss import stage1_silhouette_loss
 from nerf.refinement_experiment import _train_branch
+from nerf.refinement_texture import stage1_image_gradient_loss
 
 try:
     import nvdiffrast.torch as nvdiffrast
@@ -167,6 +168,13 @@ class SilhouetteTest(unittest.TestCase):
                                                      offsets, retain_graph=True)[0]
                     self.assertTrue(torch.isfinite(depth_grad).all())
                     self.assertGreater(depth_grad.abs().sum().item(), 0.)
+                    target = torch.zeros(16, 16, 3, device='cuda')
+                    target[:, 8:] = 1.
+                    image_loss, valid_count = stage1_image_gradient_loss(outputs['image'].reshape(16, 16, 3),
+                                                                          target, torch.ones(16, 16, device='cuda'))
+                    self.assertEqual(valid_count, 14 * 14)
+                    image_grad = torch.autograd.grad(image_loss, offsets, retain_graph=True)[0]
+                    self.assertTrue(torch.isfinite(image_grad).all())
                     loss = stage1_silhouette_loss(outputs['alpha'], torch.zeros(256, 4, device='cuda'), {})
                     loss.backward()
                     self.assertTrue(torch.isfinite(offsets.grad).all())
