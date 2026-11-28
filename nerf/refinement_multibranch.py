@@ -169,6 +169,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                     old_f_cumsum, scaler_state, start_step):
     opt = trainer.opt
     contour_radius = getattr(opt, 'refine_silhouette_radius', 8.0)
+    diagnose_gradients = getattr(opt, 'refine_face_gradient_diagnostics', False)
     policy_mode = getattr(opt, 'refine_multibranch_policy_mode', 'threshold')
     if policy_mode not in ('threshold', 'rank'):
         raise ValueError('Unknown multi-branch policy evaluation mode')
@@ -210,6 +211,19 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                getattr(policy, 'candidate_settings', {}).get('mode') == 'hybrid' or
                                getattr(comparison_policy, 'candidate_settings', {}).get('mode') == 'hybrid' or
                                getattr(opt, 'refine_multiround_grad_weight', 0.) > 0)
+    collect_selection_texture = use_texture_observation or diagnose_gradients
+    hybrid_reference = None
+    if diagnose_gradients:
+        for source in (primary_policy, comparison_policy):
+            config = getattr(source, 'candidate_settings', {})
+            if config.get('mode') == 'hybrid':
+                hybrid_reference = {'area_fraction': config['area_fraction'], 'texture_fraction': config['texture_fraction'],
+                                    'min_area': config['min_area'], 'source': 'hybrid policy checkpoint'}
+                break
+        if hybrid_reference is None:
+            hybrid_reference = {'area_fraction': getattr(opt, 'refine_area_fraction', .4),
+                                'texture_fraction': getattr(opt, 'refine_texture_fraction', .1),
+                                'min_area': getattr(opt, 'refine_min_face_area', 1e-12), 'source': 'command line defaults'}
     comparison_initial = copy.deepcopy(comparison_policy.state_dict()) if comparison_policy is not None else None
     model = trainer.model
     warmup_steps = getattr(opt, 'refine_gradient_ema_warmup_steps', 0)
@@ -286,6 +300,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
               'training_indices': training_indices, 'training_seeds': training_seeds,
               'policy_evaluation_mode': policy_mode,
               'primary_policy_action_mode': 'categorical_greedy' if isinstance(primary_policy, RankedTextureFacePolicy) else policy_mode,
+              'face_gradient_diagnostics': {'enabled': diagnose_gradients, 'hybrid_reference': hybrid_reference,
+                                            'views': selection_views, 'dataset': 'validation selection views'},
               'rl_selection': 'descending shared policy score among visible faces',
               'high_error_selection': 'descending average RGB error among visible faces',
               'random_selection': 'seeded permutation of visible faces', 'branches': []}
@@ -326,7 +342,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         branch_name = '{}_{}'.format(method, random_seed) if random_seed is not None else method
         for round_index in range(opt.refine_multibranch_rounds):
             face_count = len(model.triangles)
-            observations = _observe_silhouette(trainer, val_data, selection_views, texture=use_texture_observation)
+            observations = _observe_silhouette(trainer, val_data, selection_views, texture=collect_selection_texture)
             vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
             faces = model.triangles.cpu().numpy()
             sums, counts, means, areas, near_counts, min_distance, contour_views = selection_face_observations(
@@ -433,7 +449,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             training_losses = _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
                           vertex_state if is_rl and isinstance(policy, CandidatePolicy) else None,
                           policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
-            after_selection = _observe_silhouette(trainer, val_data, selection_views, texture=use_texture_observation)
+            after_selection = _observe_silhouette(trainer, val_data, selection_views, texture=collect_selection_texture)
             if graph_files is not None:
                 post_sums, post_pixels, post_views = visibility_counts(after_selection, len(model.triangles))
                 post_kw = dict(candidate_mode=settings['mode'], area_fraction=settings['area_fraction'], texture_fraction=settings['texture_fraction'])
@@ -460,6 +476,38 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                 grad_before = grad_after = np.full(face_count, np.nan)
                 texture_sum = texture_error_sum = np.zeros(face_count)
                 texture_counts = np.zeros(face_count, dtype=np.int64)
+            diagnostic_files = None
+            if diagnose_gradients:
+                from nerf.refinement_gradient_diagnostics import gradient_diagnostics
+                _, diagnostic_texture_sum, diagnostic_texture_counts = texture_face_sums(observations, face_count)
+                _, _, diagnostic_views = visibility_counts(observations, face_count)
+                diagnostic_ids, _, diagnostic_candidate_info = candidate_features(
+                    vertices, faces, sums, counts, diagnostic_views, len(selection_views),
+                    np.zeros(len(vertices)), np.zeros(len(vertices), dtype=bool),
+                    1.0 if round_budget else 0.0, min_area=hybrid_reference['min_area'],
+                    candidate_mode='hybrid', area_fraction=hybrid_reference['area_fraction'],
+                    texture_fraction=hybrid_reference['texture_fraction'],
+                    texture_error_sum=diagnostic_texture_sum, texture_pixels=diagnostic_texture_counts)
+                hybrid_mask = np.zeros(face_count, dtype=bool)
+                hybrid_mask[diagnostic_ids] = True
+                valid_faces = (counts > 0) & np.isfinite(sums) & np.isfinite(areas) & (areas > hybrid_reference['min_area'])
+                diagnostic, diagnostic_arrays = gradient_diagnostics(
+                    observations, after_selection, face_count, valid_faces, hybrid_mask,
+                    executed, passive, event['parent_face_id'], selection_views, evaluation_views)
+                diagnostic['method'] = method
+                diagnostic['random_seed'] = random_seed
+                diagnostic['round'] = round_index + 1
+                diagnostic['color_space'] = getattr(opt, 'color_space', 'srgb')
+                diagnostic['hybrid_reference'] = hybrid_reference
+                diagnostic['hybrid_candidate_info'] = diagnostic_candidate_info
+                diagnostic['actual_candidate_rule'] = branch['candidate_rule']
+                diagnostic['actual_added_faces'] = actual
+                diagnostic_arrays['actual_policy_candidate'] = candidate_mask if is_rl else (counts > 0)
+                diagnostic_arrays['parent_face_id'] = np.asarray(event['parent_face_id'], dtype=np.int64)
+                diagnostic_files = {'summary': 'gradient_diagnostics_{}_round_{:04d}.json'.format(branch_name, round_index + 1),
+                                    'faces': 'gradient_diagnostics_{}_round_{:04d}.npz'.format(branch_name, round_index + 1)}
+                _save_json(os.path.join(opt.refine_experiment_output, diagnostic_files['summary']), diagnostic)
+                np.savez_compressed(os.path.join(opt.refine_experiment_output, diagnostic_files['faces']), **diagnostic_arrays)
             outcomes = edge_outcomes(event, face_count, rgb_counts, rgb_before, rgb_after,
                                      sil_counts, sil_before, sil_after, grad_counts, grad_before, grad_after)
             face_cost = edge_costs(event, face_count)
@@ -512,6 +560,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                      'face_observations': observations_file, 'contour_views': contour_views,
                                      'candidate_info': candidate_info,
                                      'observation_graphs': graph_files,
+                                     'face_gradient_diagnostics': diagnostic_files,
                                      'edge_outcomes': outcomes,
                                      'cumulative_added_faces': cumulative, 'unfilled_budget': round_budget - actual,
                                      'training_indices': training_indices[round_index],

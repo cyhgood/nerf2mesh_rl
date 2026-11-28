@@ -479,7 +479,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
               'lineage_missing_rule': 'renormalize positive-area valid children; otherwise retain valid local reward'}
     excluded_options = {'refine_experiment_output', 'refine_multiround_resume', 'refine_multiround_rounds',
-                        'refine_multiround_horizon', 'refine_silhouette_radius', 'refine_multibranch_compare_policy'}
+                        'refine_multiround_horizon', 'refine_silhouette_radius', 'refine_multibranch_compare_policy',
+                        'refine_face_gradient_diagnostics'}
     config['options'] = {key: value for key, value in vars(opt).items() if key not in excluded_options}
     if getattr(opt, 'lambda_stage1_depth', 0) > 0:
         from nerf.stage1_depth import Stage1DepthSource
@@ -564,6 +565,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         for key in ('refine_multibranch_policy_mode',):
             old_options.pop(key, None)
             requested_options.pop(key, None)
+        old_options.pop('refine_face_gradient_diagnostics', None)
+        requested_options.pop('refine_face_gradient_diagnostics', None)
         for key in (('refine_observation_graph',) if policy_type == 'gnn' else ('refine_observation_graph', 'refine_graph_self_loops')):
             old_options.pop(key, None)
             requested_options.pop(key, None)

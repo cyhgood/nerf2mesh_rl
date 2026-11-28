@@ -157,6 +157,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_reinitialize_legacy_policy', action='store_true', help='reinitialize incompatible completed legacy policy and vertex EMA')
     parser.add_argument('--refine_multiround_resume', type=str, default='', help='resume trajectory checkpoint')
     parser.add_argument('--refine_multibranch_eval', action='store_true', help='compare RL, high-error and random over consecutive refinement rounds')
+    parser.add_argument('--refine_face_gradient_diagnostics', action='store_true', help='save per-face fixed-region gradient diagnostics during multi-branch evaluation')
     parser.add_argument('--refine_multibranch_policy', type=str, default='', help='multi-round trajectory.pt containing the fixed RL policy')
     parser.add_argument('--refine_multibranch_compare_policy', type=str, default='', help='optional second MLP/GNN trajectory for matched policy comparison')
     parser.add_argument('--refine_multibranch_policy_mode', choices=['threshold', 'rank'], default='threshold', help='threshold at 0.5 or rank candidates with current remaining budget')

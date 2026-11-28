@@ -227,6 +227,24 @@ class MultiBranchTest(unittest.TestCase):
                 self.assertIn('silhouette_after', saved.files)
             self.assertIn('edge_outcomes', rl['rounds'][0])
 
+            model = Model(); trainer.model = model; trainer.global_step = 10; opt.refine = True
+            opt.refine_face_gradient_diagnostics = True
+            opt.refine_experiment_output = os.path.join(directory, 'mlp_diagnostics')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                mlp_diagnostics = json.load(source)
+            for original, diagnosed in zip(candidate_result['branches'], mlp_diagnostics['branches']):
+                for old_round, new_round in zip(original['rounds'], diagnosed['rounds']):
+                    self.assertEqual(old_round['event'], new_round['event'])
+                    self.assertEqual(old_round['metrics'], new_round['metrics'])
+                    with np.load(os.path.join(directory, 'candidates', old_round['face_observations'])) as old_data, \
+                         np.load(os.path.join(opt.refine_experiment_output, new_round['face_observations'])) as new_data:
+                        np.testing.assert_array_equal(old_data['selection_region_local_reward'], new_data['selection_region_local_reward'])
+            opt.refine_face_gradient_diagnostics = False
+
             gnn_path = os.path.join(directory, 'gnn.pt')
             torch.save({'policy': SparseFacePolicy().state_dict(), 'config': {
                 'checkpoint_sha256': file_sha256(checkpoint), 'mesh_sha256': file_sha256(mesh),
@@ -294,6 +312,33 @@ class MultiBranchTest(unittest.TestCase):
             self.assertEqual(new_branch['rounds'][0]['candidate_info']['candidate_mode'], 'hybrid')
             self.assertEqual(new_branch['rounds'][0]['candidate_info']['fallback_count'], 0)
             self.assertGreater(new_branch['actual_added_faces'], 0)
+            self.assertFalse(categorical_pair['face_gradient_diagnostics']['enabled'])
+            self.assertIsNone(new_branch['rounds'][0]['face_gradient_diagnostics'])
+            model = Model(); trainer.model = model; trainer.global_step = 10; opt.refine = True
+            opt.refine_face_gradient_diagnostics = True
+            opt.refine_experiment_output = os.path.join(directory, 'categorical_diagnostics')
+            os.mkdir(opt.refine_experiment_output)
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                diagnosed = json.load(source)
+            self.assertTrue(diagnosed['face_gradient_diagnostics']['enabled'])
+            for baseline, branch in zip(categorical_pair['branches'], diagnosed['branches']):
+                self.assertEqual(baseline['actual_added_faces'], branch['actual_added_faces'])
+                for original, step in zip(baseline['rounds'], branch['rounds']):
+                    self.assertEqual(original['event'], step['event'])
+                    self.assertEqual(original['metrics'], step['metrics'])
+                    with open(os.path.join(opt.refine_experiment_output, step['face_gradient_diagnostics']['summary'])) as source:
+                        report = json.load(source)
+                    self.assertEqual(report['diagnostic_views'], [0])
+                    self.assertEqual(report['independent_evaluation_views'], [1])
+                    self.assertIn('hybrid_candidates', report['groups'])
+                    self.assertEqual(report['actual_added_faces'], step['actual_added_faces'])
+                    with np.load(os.path.join(opt.refine_experiment_output, step['face_gradient_diagnostics']['faces'])) as data:
+                        self.assertEqual(len(data['old_face_id']), step['faces_before'])
+                        np.testing.assert_array_equal(data['parent_face_id'], step['event']['parent_face_id'])
+            opt.refine_face_gradient_diagnostics = False
             opt.refine_multibranch_policy_mode = 'threshold'
             opt.refine_multibranch_policy = policy_path
             opt.refine_multibranch_compare_policy = gnn_path
