@@ -86,6 +86,9 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_offsets', type=float, default=0.1, help="loss scale")#顶点偏移L2正则化
     parser.add_argument('--lambda_sil', type=float, default=0, help='Stage 1 full-image silhouette L1 loss weight')
     parser.add_argument('--lambda_image_grad', type=float, default=0, help='Stage 1 foreground image Sobel gradient loss weight')
+    parser.add_argument('--lambda_texture_weighted_grad', type=float, default=0, help='Stage 1 texture-weighted Sobel loss coefficient')
+    parser.add_argument('--texture_gradient_gain', type=float, default=1.0, help='target gradient weight gain')
+    parser.add_argument('--texture_gradient_weight_cap', type=float, default=4.0, help='maximum unnormalized texture weight')
     parser.add_argument('--lambda_stage1_depth', type=float, default=0, help='Stage 1 valid surface depth L1 weight (default disabled)')
     parser.add_argument('--stage1_depth_manifest', default='', help='explicit training-view float NPY depth manifest')
     parser.add_argument('--lambda_lap', type=float, default=0.001, help="loss scale")#拉普拉斯平滑损失
@@ -184,6 +187,12 @@ if __name__ == '__main__':
         parser.error('--lambda_image_grad must be finite and nonnegative')
     if opt.lambda_image_grad > 0 and opt.stage != 1:
         parser.error('--lambda_image_grad requires --stage 1')
+    if (not math.isfinite(opt.lambda_texture_weighted_grad) or opt.lambda_texture_weighted_grad < 0 or
+            not math.isfinite(opt.texture_gradient_gain) or opt.texture_gradient_gain < 0 or
+            not math.isfinite(opt.texture_gradient_weight_cap) or opt.texture_gradient_weight_cap < 1):
+        parser.error('Texture-weighted gradient loss requires nonnegative finite coefficient/gain and cap >= 1')
+    if opt.lambda_texture_weighted_grad > 0 and opt.stage != 1:
+        parser.error('--lambda_texture_weighted_grad requires --stage 1')
 
     if not math.isfinite(opt.lambda_stage1_depth) or opt.lambda_stage1_depth < 0:
         parser.error('--lambda_stage1_depth must be finite and nonnegative')

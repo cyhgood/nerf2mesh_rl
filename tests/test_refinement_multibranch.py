@@ -334,10 +334,13 @@ class MultiBranchTest(unittest.TestCase):
                     self.assertEqual(report['diagnostic_views'], [0])
                     self.assertEqual(report['independent_evaluation_views'], [1])
                     self.assertIn('hybrid_candidates', report['groups'])
+                    self.assertIn('topology_change', report['three_phase']['groups']['visible_valid'])
+                    self.assertIn('optimization_change', report['three_phase']['groups']['visible_valid'])
                     self.assertEqual(report['actual_added_faces'], step['actual_added_faces'])
                     with np.load(os.path.join(opt.refine_experiment_output, step['face_gradient_diagnostics']['faces'])) as data:
                         self.assertEqual(len(data['old_face_id']), step['faces_before'])
                         np.testing.assert_array_equal(data['parent_face_id'], step['event']['parent_face_id'])
+                        self.assertEqual(len(data['three_phase_pixels']), step['faces_before'])
             opt.refine_face_gradient_diagnostics = False
             opt.refine_multibranch_policy_mode = 'threshold'
             opt.refine_multibranch_policy = policy_path

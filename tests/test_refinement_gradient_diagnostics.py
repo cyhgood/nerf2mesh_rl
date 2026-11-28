@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from nerf.refinement_gradient_diagnostics import gradient_diagnostics
+from nerf.refinement_gradient_diagnostics import gradient_diagnostics, three_phase_gradient_diagnostics
 
 
 def observation(faces, errors, coverage, finite=None):
@@ -55,6 +55,24 @@ class GradientDiagnosticsTest(unittest.TestCase):
         self.assertTrue(np.isnan(arrays['pre_gradient_error'][0]))
         with self.assertRaisesRegex(ValueError, 'matching'):
             gradient_diagnostics([old], [], 1, [1], [1], [1], [0], [0], [0], [1])
+
+    def test_three_phases_share_intersection_and_decompose_change(self):
+        old = observation([0, 0, 0, 1, 1, 1, 2, 2], [.2, .6, 1, 2, 2, 2, 3, 3], [1] * 8)
+        split = observation([0, -1, 2, 99, 2, 3, -1, -1], [.15, .7, .8, 1, 1.75, 0, .1, .1],
+                            [1] * 8, [1, 1, 0, 1, 1, 1, 1, 1])
+        final = observation([0, -1, 2, 99, 2, 3, -1, -1], [.1, .5, .9, 1, 1.5, 0, .1, .1],
+                            [1] * 8, [1, 1, 1, 1, 1, 0, 1, 1])
+        report, arrays = three_phase_gradient_diagnostics([old], [split], [final], 3, [1, 1, 1], [1, 0, 1],
+                                                           [1, 0, 0], [0, 1, 0], [0, 0, 1, 1], [4], [9])
+        self.assertEqual(arrays['three_phase_pixels'].tolist(), [2, 1, 0])
+        self.assertAlmostEqual(arrays['topology_improvement'][0], -.025)
+        self.assertAlmostEqual(arrays['optimization_improvement'][0], .125)
+        self.assertAlmostEqual(arrays['topology_improvement'][0] + arrays['optimization_improvement'][0], .1)
+        group = report['groups']['executed_requesters']
+        self.assertEqual(group['after_split_coverage_and_mapping']['lost_coverage_pixels'], 1)
+        self.assertEqual(group['after_optimization_coverage_and_mapping']['lost_coverage_pixels'], 1)
+        self.assertEqual(group['valid_pixels'], 2)
+        self.assertIsNone(report['groups']['unchanged']['after_split_error'])
 
 
 if __name__ == '__main__':

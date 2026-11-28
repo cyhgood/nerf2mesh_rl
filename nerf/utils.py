@@ -31,7 +31,7 @@ from torch_ema import ExponentialMovingAverage
 from packaging import version as pver
 import lpips
 from nerf.silhouette_loss import stage1_silhouette_loss, stage1_foreground_alpha
-from nerf.refinement_texture import stage1_image_gradient_loss
+from nerf.refinement_texture import stage1_image_gradient_loss, stage1_texture_weighted_gradient_loss
 from nerf.stage1_depth import Stage1DepthSource, stage1_depth_loss
 
 def custom_meshgrid(*args):
@@ -637,6 +637,9 @@ class Trainer(object):
         self.loss_image_grad = None
         self.weighted_loss_image_grad = None
         self.image_grad_valid_pixels = None
+        self.loss_texture_weighted_grad = None
+        self.scaled_loss_texture_weighted_grad = None
+        self.texture_gradient_weight_stats = None
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         index = data['index'] # [1/N]
@@ -746,7 +749,8 @@ class Trainer(object):
  
         if self.opt.stage == 1:
             lambda_image_grad = getattr(self.opt, 'lambda_image_grad', 0.0)
-            if lambda_image_grad > 0:
+            lambda_texture_grad = getattr(self.opt, 'lambda_texture_weighted_grad', 0.0)
+            if lambda_image_grad > 0 or lambda_texture_grad > 0:
                 foreground = stage1_foreground_alpha(images, data, (H, W), pred_rgb.device)
                 # Undo the random-background composite using the attached AA alpha.
                 # The result is exactly the same rendering on a fixed white background.
@@ -756,8 +760,17 @@ class Trainer(object):
                     target_white = images[..., :3] * images[..., 3:] + (1 - images[..., 3:])
                 else:
                     target_white = images[..., :3]
-                loss_image_grad, valid_pixels = stage1_image_gradient_loss(
-                    prediction_white.reshape(H, W, 3), target_white.reshape(H, W, 3), foreground)
+                if lambda_texture_grad > 0:
+                    loss_image_grad, texture_loss, valid_pixels, weight_stats = stage1_texture_weighted_gradient_loss(
+                        prediction_white.reshape(H, W, 3), target_white.reshape(H, W, 3), foreground,
+                        getattr(self.opt, 'texture_gradient_gain', 1.), getattr(self.opt, 'texture_gradient_weight_cap', 4.))
+                    self.loss_texture_weighted_grad = texture_loss.detach()
+                    self.scaled_loss_texture_weighted_grad = (lambda_texture_grad * texture_loss).detach()
+                    self.texture_gradient_weight_stats = weight_stats
+                    loss = loss + lambda_texture_grad * texture_loss
+                else:
+                    loss_image_grad, valid_pixels = stage1_image_gradient_loss(
+                        prediction_white.reshape(H, W, 3), target_white.reshape(H, W, 3), foreground)
                 self.loss_image_grad = loss_image_grad.detach()
                 self.weighted_loss_image_grad = (lambda_image_grad * loss_image_grad).detach()
                 self.image_grad_valid_pixels = valid_pixels
@@ -1217,6 +1230,12 @@ class Trainer(object):
                         self.writer.add_scalar("train/loss_image_grad", self.loss_image_grad.item(), self.global_step)
                         self.writer.add_scalar("train/weighted_loss_image_grad", self.weighted_loss_image_grad.item(), self.global_step)
                         self.writer.add_scalar("train/image_grad_valid_pixels", self.image_grad_valid_pixels, self.global_step)
+                    if self.loss_texture_weighted_grad is not None:
+                        self.writer.add_scalar("train/loss_texture_weighted_grad", self.loss_texture_weighted_grad.item(), self.global_step)
+                        self.writer.add_scalar("train/scaled_loss_texture_weighted_grad", self.scaled_loss_texture_weighted_grad.item(), self.global_step)
+                        for key, value in self.texture_gradient_weight_stats.items():
+                            if value is not None:
+                                self.writer.add_scalar("train/texture_weight_" + key, value, self.global_step)
                     if self.loss_stage1_depth is not None:
                         self.writer.add_scalar("train/loss_stage1_depth", self.loss_stage1_depth.item(), self.global_step)
                         self.writer.add_scalar("train/stage1_depth_valid_pixels", self.stage1_depth_valid_count, self.global_step)

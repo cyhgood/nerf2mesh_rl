@@ -446,6 +446,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             executed = np.zeros(face_count, dtype=bool)
             executed[[edge['requester_face'] for edge in event['edge_events']]] = True
             observations_file = 'faces_{}_round_{:04d}.npz'.format(branch_name, round_index + 1)
+            after_split = (_observe_silhouette(trainer, val_data, selection_views, texture=True)
+                           if diagnose_gradients else None)
             training_losses = _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
                           vertex_state if is_rl and isinstance(policy, CandidatePolicy) else None,
                           policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
@@ -478,7 +480,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                 texture_counts = np.zeros(face_count, dtype=np.int64)
             diagnostic_files = None
             if diagnose_gradients:
-                from nerf.refinement_gradient_diagnostics import gradient_diagnostics
+                from nerf.refinement_gradient_diagnostics import gradient_diagnostics, three_phase_gradient_diagnostics
                 _, diagnostic_texture_sum, diagnostic_texture_counts = texture_face_sums(observations, face_count)
                 _, _, diagnostic_views = visibility_counts(observations, face_count)
                 diagnostic_ids, _, diagnostic_candidate_info = candidate_features(
@@ -494,6 +496,10 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                 diagnostic, diagnostic_arrays = gradient_diagnostics(
                     observations, after_selection, face_count, valid_faces, hybrid_mask,
                     executed, passive, event['parent_face_id'], selection_views, evaluation_views)
+                diagnostic['three_phase'], three_phase_arrays = three_phase_gradient_diagnostics(
+                    observations, after_split, after_selection, face_count, valid_faces, hybrid_mask,
+                    executed, passive, event['parent_face_id'], selection_views, evaluation_views)
+                diagnostic_arrays.update(three_phase_arrays)
                 diagnostic['method'] = method
                 diagnostic['random_seed'] = random_seed
                 diagnostic['round'] = round_index + 1

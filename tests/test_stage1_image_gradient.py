@@ -4,13 +4,42 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from nerf.refinement_texture import stage1_image_gradient_loss, sobel_observation
+from nerf.refinement_texture import stage1_image_gradient_loss, stage1_texture_weighted_gradient_loss, sobel_observation
 from nerf.silhouette_loss import stage1_foreground_alpha, stage1_silhouette_loss
 from nerf.refinement_experiment import _train_branch
 from test_stage1_silhouette import load_methods
 
 
 class Stage1ImageGradientTest(unittest.TestCase):
+    def test_texture_weights_are_bounded_and_masked(self):
+        target = torch.zeros(7, 7, 3)
+        target[:, 3:] = .4
+        target[3, 4] = 1.
+        pred = torch.zeros_like(target, requires_grad=True)
+        alpha = torch.ones(7, 7)
+        ordinary, weighted, count, stats = stage1_texture_weighted_gradient_loss(pred, target, alpha, gain=3., cap=2.)
+        self.assertEqual(count, 25)
+        self.assertAlmostEqual(stats['mean'], 1., places=6)
+        self.assertLessEqual(stats['raw_max'], 2.)
+        self.assertLessEqual(stats['max'], 2.)
+        self.assertGreater(weighted.item(), ordinary.item())
+        weighted.backward()
+        self.assertTrue(torch.isfinite(pred.grad).all())
+        self.assertGreater(pred.grad.abs().sum().item(), 0.)
+        unweighted, same, _, stats = stage1_texture_weighted_gradient_loss(pred, target, alpha, gain=0., cap=2.)
+        torch.testing.assert_close(unweighted, same)
+        self.assertEqual(stats['min'], 1.)
+        _, empty, count, stats = stage1_texture_weighted_gradient_loss(pred, target, torch.zeros_like(alpha))
+        self.assertEqual(count, 0)
+        self.assertEqual(empty.item(), 0.)
+        self.assertIsNone(stats['max'])
+        target = torch.zeros(7, 7, 3); alpha[:, 4:] = 0
+        pred2 = torch.zeros_like(target); pred2[:, 4:] = torch.rand(7, 3, 3)
+        _, weighted, count, _ = stage1_texture_weighted_gradient_loss(pred2, target, alpha)
+        self.assertEqual(count, 10)
+        self.assertEqual(weighted.item(), 0.)
+        with self.assertRaisesRegex(ValueError, 'cap'):
+            stage1_texture_weighted_gradient_loss(pred, target, alpha, cap=.5)
     def test_renderer_ssaa_image_alignment(self):
         class Raster:
             def rasterize(self, ctx, vertices, triangles, shape):
@@ -76,7 +105,8 @@ class Stage1ImageGradientTest(unittest.TestCase):
     def test_training_branch_and_fixed_background(self):
         namespace = {'torch': torch, 'stage1_silhouette_loss': stage1_silhouette_loss,
                      'stage1_foreground_alpha': stage1_foreground_alpha,
-                     'stage1_image_gradient_loss': stage1_image_gradient_loss}
+                     'stage1_image_gradient_loss': stage1_image_gradient_loss,
+                     'stage1_texture_weighted_gradient_loss': stage1_texture_weighted_gradient_loss}
         train_step, = load_methods('nerf/utils.py', 'Trainer', ['train_step'], namespace)
         class Model(torch.nn.Module):
             def __init__(self):
@@ -120,6 +150,11 @@ class Stage1ImageGradientTest(unittest.TestCase):
         torch.manual_seed(9)
         trainer.train_step(data)
         torch.testing.assert_close(loss0, trainer.loss_image_grad, atol=1e-7, rtol=1e-6)
+        opt.lambda_texture_weighted_grad = .5
+        torch.manual_seed(0)
+        _, _, weighted_total = trainer.train_step(data)
+        self.assertAlmostEqual(weighted_total.item() - total.item(), trainer.scaled_loss_texture_weighted_grad.item(), places=6)
+        self.assertAlmostEqual(trainer.texture_gradient_weight_stats['mean'], 1., places=6)
         trainer.scaler = torch.cuda.amp.GradScaler(enabled=False)
         trainer.optimizer_fn = lambda m: torch.optim.SGD(m.parameters(), lr=.1)
         trainer.lr_scheduler_fn = lambda opt: torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1)
@@ -128,6 +163,8 @@ class Stage1ImageGradientTest(unittest.TestCase):
         self.assertEqual(len(stats['loss_image_grad_steps']), 2)
         self.assertEqual(stats['image_grad_valid_pixels'], [9, 9])
         self.assertAlmostEqual(stats['weighted_loss_image_grad_steps'][0], stats['loss_image_grad_steps'][0] * 2.)
+        self.assertEqual(len(stats['loss_texture_weighted_grad_steps']), 2)
+        self.assertEqual(len(stats['texture_gradient_weight_stats']), 2)
 
 
 if __name__ == '__main__':

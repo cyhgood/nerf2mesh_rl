@@ -112,6 +112,9 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
     image_gradient_losses = []
     weighted_image_gradient_losses = []
     image_gradient_valid_pixels = []
+    texture_weighted_losses = []
+    scaled_texture_weighted_losses = []
+    texture_weight_stats = []
     for index in indices:
         trainer.global_step += 1
         trainer.optimizer.zero_grad()
@@ -125,6 +128,10 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
             image_gradient_losses.append(float(trainer.loss_image_grad.item()))
             weighted_image_gradient_losses.append(float(trainer.weighted_loss_image_grad.item()))
             image_gradient_valid_pixels.append(trainer.image_grad_valid_pixels)
+        if getattr(trainer, 'loss_texture_weighted_grad', None) is not None:
+            texture_weighted_losses.append(float(trainer.loss_texture_weighted_grad.item()))
+            scaled_texture_weighted_losses.append(float(trainer.scaled_loss_texture_weighted_grad.item()))
+            texture_weight_stats.append(trainer.texture_gradient_weight_stats)
         trainer.scaler.scale(loss).backward()
         trainer.post_train_step()
         norms = None
@@ -154,7 +161,11 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
             'weighted_loss_image_grad_steps': weighted_image_gradient_losses,
             'image_grad_valid_pixels': image_gradient_valid_pixels,
             'loss_image_grad_mean': float(np.mean(image_gradient_losses)) if image_gradient_losses else None,
-            'weighted_loss_image_grad_mean': float(np.mean(weighted_image_gradient_losses)) if weighted_image_gradient_losses else None}
+            'weighted_loss_image_grad_mean': float(np.mean(weighted_image_gradient_losses)) if weighted_image_gradient_losses else None,
+            'loss_texture_weighted_grad_steps': texture_weighted_losses,
+            'scaled_loss_texture_weighted_grad_steps': scaled_texture_weighted_losses,
+            'loss_texture_weighted_grad_mean': float(np.mean(texture_weighted_losses)) if texture_weighted_losses else None,
+            'texture_gradient_weight_stats': texture_weight_stats}
 
 
 def _warmup_vertex_ema(trainer, dataset, vertex_state, steps, beta, seed):

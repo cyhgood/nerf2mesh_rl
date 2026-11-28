@@ -581,6 +581,9 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             requested_options.pop('lambda_sil', None)
             old_options.pop('lambda_image_grad', None)
             requested_options.pop('lambda_image_grad', None)
+            for key in ('lambda_texture_weighted_grad', 'texture_gradient_gain', 'texture_gradient_weight_cap'):
+                old_options.pop(key, None)
+                requested_options.pop(key, None)
             for key in ('lambda_stage1_depth', 'stage1_depth_manifest'):
                 old_options.pop(key, None)
                 requested_options.pop(key, None)
@@ -590,6 +593,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             requested_options.pop('lambda_sil', None)
         if not saved['completed'] and 'lambda_image_grad' not in old_options and requested_options.get('lambda_image_grad', 0) == 0:
             requested_options.pop('lambda_image_grad', None)
+        if not saved['completed']:
+            for key, default in (('lambda_texture_weighted_grad', 0.), ('texture_gradient_gain', 1.), ('texture_gradient_weight_cap', 4.)):
+                if key not in old_options and requested_options.get(key, default) == default:
+                    requested_options.pop(key, None)
         if not saved['completed'] and 'lambda_stage1_depth' not in old_options and requested_options.get('lambda_stage1_depth', 0) == 0:
             requested_options.pop('lambda_stage1_depth', None)
             if not requested_options.get('stage1_depth_manifest', ''):

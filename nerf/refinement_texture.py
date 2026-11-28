@@ -64,6 +64,29 @@ def stage1_image_gradient_loss(prediction, target, alpha):
     return safe.reshape(-1)[:1].sum() * 0., 0
 
 
+def stage1_texture_weighted_gradient_loss(prediction, target, alpha, gain=1., cap=4.):
+    """Texture-emphasized loss with bounded, mean-one detached target weights."""
+    if not np.isfinite(gain) or gain < 0 or not np.isfinite(cap) or cap < 1:
+        raise ValueError('Texture weight gain must be nonnegative and cap at least one')
+    strength, error, valid, _ = sobel_tensors(prediction, target, alpha)
+    valid = valid & torch.isfinite(strength) & torch.isfinite(error)
+    count = int(valid.sum().item())
+    if not count:
+        safe = torch.where(torch.isfinite(prediction), prediction, torch.zeros_like(prediction))
+        zero = safe.reshape(-1)[:1].sum() * 0.
+        return zero, zero, 0, {'scale': None, 'min': None, 'max': None, 'mean': None, 'raw_max': None}
+    with torch.no_grad():
+        values = strength.detach()[valid]
+        positive = values[values > 0]
+        scale = positive.median().clamp(min=1e-6) if len(positive) else values.new_tensor(1.)
+        raw_weights = (1. + gain * values / scale).clamp(max=cap)
+        weights = raw_weights / raw_weights.mean()
+        stats = {'scale': float(scale.item()), 'min': float(weights.min().item()),
+                 'max': float(weights.max().item()), 'mean': float(weights.mean().item()),
+                 'raw_max': float(raw_weights.max().item())}
+    return error[valid].mean(), (error[valid] * weights).mean(), count, stats
+
+
 def texture_face_sums(observations, face_count):
     strength = np.zeros(face_count, dtype=np.float64)
     error = np.zeros(face_count, dtype=np.float64)

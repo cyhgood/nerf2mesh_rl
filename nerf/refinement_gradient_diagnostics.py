@@ -127,3 +127,80 @@ def gradient_diagnostics(before, after, face_count, visible_valid, hybrid_candid
                 'group_overlap': 'hybrid, executed, passive and unchanged are separate overlapping views; only executed/passive/unchanged partition old faces',
                 'groups': summary}
     return metadata, arrays
+
+
+def three_phase_gradient_diagnostics(before, after_split, after_optimization, face_count, visible_valid,
+                                     hybrid_candidates, executed, passive, parent_face_id,
+                                     selection_views, evaluation_views):
+    """Compare three renders on the intersection of the original fixed region."""
+    if len(before) != len(after_split) or len(before) != len(after_optimization):
+        raise ValueError('Three-phase diagnostic views must match')
+    args = (face_count, visible_valid, hybrid_candidates, executed, passive,
+            parent_face_id, selection_views, evaluation_views)
+    split_report, _ = gradient_diagnostics(before, after_split, *args)
+    final_report, _ = gradient_diagnostics(before, after_optimization, *args)
+    parent = np.asarray(parent_face_id if parent_face_id is not None else [], dtype=np.int64).reshape(-1)
+    parent_valid = (parent >= 0) & (parent < face_count)
+    has_child = np.bincount(parent[parent_valid], minlength=face_count) > 0
+    common_before = []
+    for old, split, final in zip(before, after_split, after_optimization):
+        if old[4] != split[4] or old[4] != final[4]:
+            raise ValueError('Three-phase diagnostic dimensions must match')
+        old_faces = old[0]
+        valid_old = (old_faces >= 0) & (old_faces < face_count)
+        child = np.zeros(len(old_faces), dtype=bool)
+        child[valid_old] = has_child[old_faces[valid_old]]
+        common = old[-1] & valid_old & child & np.isfinite(old[-4]) & np.isfinite(old[-3])
+        for current in (split, final):
+            face_ids = current[0]
+            in_range = (face_ids >= 0) & (face_ids < len(parent))
+            valid_parent = np.zeros(len(face_ids), dtype=bool)
+            valid_parent[in_range] = parent_valid[face_ids[in_range]]
+            correspondence = (face_ids < 0) | valid_parent
+            common &= current[-2] & np.isfinite(current[-3]) & correspondence
+        filtered = list(old)
+        filtered[-1] = common
+        common_before.append(tuple(filtered))
+    _, split_arrays = gradient_diagnostics(common_before, after_split, *args)
+    _, final_arrays = gradient_diagnostics(common_before, after_optimization, *args)
+    if not np.array_equal(split_arrays['paired_pixels'], final_arrays['paired_pixels']):
+        raise RuntimeError('Three-phase fixed pixel sets differ')
+    pixels = split_arrays['paired_pixels']
+    before_error = split_arrays['paired_before_error']
+    split_error = split_arrays['paired_after_error']
+    final_error = final_arrays['paired_after_error']
+    topology_improvement = before_error - split_error
+    optimization_improvement = split_error - final_error
+    groups = {'visible_valid': np.asarray(visible_valid, bool), 'hybrid_candidates': np.asarray(hybrid_candidates, bool),
+              'executed_requesters': np.asarray(executed, bool), 'passive_neighbors': np.asarray(passive, bool),
+              'unchanged': ~(np.asarray(executed, bool) | np.asarray(passive, bool))}
+    summaries = {}
+    for name, mask in groups.items():
+        chosen = mask & np.asarray(visible_valid, bool) & (pixels > 0)
+        count = int(pixels[chosen].sum())
+        def average(values):
+            return float(np.average(values[chosen], weights=pixels[chosen])) if count else None
+        def change(values):
+            selected = values[chosen]
+            return {'mean_improvement': _mean(selected), 'median_improvement': _median(selected),
+                    'pixel_weighted_improvement': average(values),
+                    'positive_improvement_fraction': float(np.mean(selected > 0)) if len(selected) else None}
+        summaries[name] = {'valid_faces': int(chosen.sum()), 'valid_pixels': count,
+                           'before_error': average(before_error), 'after_split_error': average(split_error),
+                           'after_optimization_error': average(final_error),
+                           'topology_change': change(topology_improvement),
+                           'optimization_change': change(optimization_improvement),
+                           'total_change': change(before_error - final_error),
+                           'after_split_coverage_and_mapping': {k: split_report['groups'][name][k] for k in (
+                               'lost_coverage_pixels', 'faces_with_lost_coverage', 'invalid_correspondence_pixels',
+                               'faces_with_invalid_correspondence', 'invalid_after_pixels', 'different_parent_pixels',
+                               'no_child_mapping_faces', 'no_paired_gradient_faces')},
+                           'after_optimization_coverage_and_mapping': {k: final_report['groups'][name][k] for k in (
+                               'lost_coverage_pixels', 'faces_with_lost_coverage', 'invalid_correspondence_pixels',
+                               'faces_with_invalid_correspondence', 'invalid_after_pixels', 'different_parent_pixels',
+                               'no_child_mapping_faces', 'no_paired_gradient_faces')}}
+    return {'pixel_set': 'intersection of pre-split fixed region with finite RGB and valid lineage at both later renders; lost coverage remains included',
+            'groups': summaries}, {'three_phase_pixels': pixels, 'three_phase_before_error': before_error,
+                                   'three_phase_after_split_error': split_error, 'three_phase_after_optimization_error': final_error,
+                                   'topology_improvement': topology_improvement,
+                                   'optimization_improvement': optimization_improvement}
