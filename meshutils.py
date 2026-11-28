@@ -232,6 +232,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     ranked = decision_fn is not None and hasattr(decision_fn, 'next_candidate')
     candidate_set = set(map(int, candidate_order)) if ranked else None
     considered_set = set() if ranked else None
+    stopped = False
     for face_id in candidate_order:
         if max_added_faces is not None and added_faces >= max_added_faces:
             if ranked:
@@ -244,6 +245,9 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
             continue
         if ranked:
             face_id = decision_fn.next_candidate(max_added_faces - added_faces)
+            if face_id is None:
+                stopped = True
+                break
             if face_id not in candidate_set or face_id in considered_set:
                 raise ValueError('Ranked selector returned an invalid or repeated face')
             considered_set.add(int(face_id))
@@ -288,7 +292,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
     if ranked:
         for face_id in candidate_order:
             if int(face_id) not in considered_set:
-                request_status[int(face_id)] = 'budget_not_considered'
+                request_status[int(face_id)] = 'stopped' if stopped else 'budget_not_considered'
 
     new_faces = []
     parent_face_id = []
@@ -318,6 +322,7 @@ def subdivide_longest_edges(verts, faces, candidates, return_event=False,
                           'passive_faces': passive, 'added_faces': added_faces,
                           'considered_count': considered_count,
                           'considered_faces': considered_faces,
+                          'stopped': stopped,
                           'cumulative_added_faces': additions},)
     return result
 

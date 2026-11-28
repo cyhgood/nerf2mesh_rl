@@ -318,6 +318,33 @@ class MultiRoundTest(unittest.TestCase):
                 np.testing.assert_array_equal(transition['policy_graph']['node_to_face'][nodes], transition['visible'])
             for key in gnn_state['policy']:
                 torch.testing.assert_close(gnn_state['policy'][key], gnn_restored['policy'][key])
+            categorical_dirs = [os.path.join(directory, name) for name in ('cat_full', 'cat_open', 'cat_resume')]
+            for path in categorical_dirs:
+                os.mkdir(path)
+            def categorical_trainer(path, resume='', rounds=2):
+                obj = make_trainer(path, ckpt, mesh, resume)
+                obj.opt.refine_policy = 'gnn'
+                obj.opt.refine_candidate_mode = 'hybrid'
+                obj.opt.refine_action_mode = 'categorical'
+                obj.opt.refine_rank_stop = False
+                obj.opt.refine_multiround_rounds = rounds
+                obj.opt.refine_multiround_horizon = 2
+                return obj
+            cat_full = categorical_trainer(categorical_dirs[0])
+            refinement_multiround.run_multiround(cat_full, Dataset(), Dataset(), [0], [1])
+            cat_open = categorical_trainer(categorical_dirs[1], rounds=1)
+            refinement_multiround.run_multiround(cat_open, Dataset(), Dataset(), [0], [1])
+            cat_resume = categorical_trainer(categorical_dirs[2], os.path.join(categorical_dirs[1], 'trajectory.pt'), 1)
+            refinement_multiround.run_multiround(cat_resume, Dataset(), Dataset(), [0], [1])
+            cat_state = torch.load(os.path.join(categorical_dirs[0], 'trajectory.pt'), map_location='cpu')
+            cat_restored = torch.load(os.path.join(categorical_dirs[2], 'trajectory.pt'), map_location='cpu')
+            self.assertEqual(cat_state['config']['action_mode'], 'categorical')
+            self.assertEqual(cat_state['transitions'][0]['candidate_info']['candidate_mode'], 'hybrid')
+            for key in cat_state['policy']:
+                torch.testing.assert_close(cat_state['policy'][key], cat_restored['policy'][key])
+            bad_action = categorical_trainer(categorical_dirs[2], os.path.join(gnn_dir, 'trajectory.pt'), 1)
+            with self.assertRaisesRegex(ValueError, 'Action distribution mismatch'):
+                refinement_multiround.run_multiround(bad_action, Dataset(), Dataset(), [0], [1])
             missing_dir = os.path.join(directory, 'gnn_missing_gradient')
             os.mkdir(missing_dir)
             missing = make_trainer(missing_dir, ckpt, mesh)

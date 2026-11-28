@@ -50,7 +50,8 @@ def add_texture_features(graph, observations):
 
 def build_face_graph(vertices, faces, sums, pixels, view_counts, num_views, vertex_ema,
                      vertex_seen, remaining_budget, round_budget, fraction=.5, min_area=1e-12,
-                     self_loops=False):
+                     self_loops=False, candidate_mode='area', area_fraction=.4, texture_fraction=.1,
+                     texture_error_sum=None, texture_pixels=None):
     """Build a sparse directed graph of geometrically valid faces.
 
     Edges with >2 incident valid faces are counted and excluded; self loops have
@@ -71,7 +72,8 @@ def build_face_graph(vertices, faces, sums, pixels, view_counts, num_views, vert
     budget_fraction = remaining_budget / round_budget if round_budget else 0.
     candidates, candidate_values, info = candidate_features(
         vertices, faces, sums, pixels, view_counts, num_views, vertex_ema, vertex_seen,
-        budget_fraction, fraction, min_area)
+        budget_fraction, fraction, min_area, candidate_mode, area_fraction, texture_fraction,
+        texture_error_sum, texture_pixels)
     areas, angles, angle_valid = normal_angles(vertices, faces, min_area)
     geometric = np.isfinite(areas) & (areas > min_area)
     ids = np.flatnonzero(geometric)

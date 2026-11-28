@@ -13,7 +13,7 @@ from nerf.refinement_multibranch import (full_frame_metrics, load_trajectory_pol
                                          selection_face_observations)
 from nerf.refinement_rl import FacePolicy, file_sha256
 from nerf.refinement_candidates import CandidatePolicy, FEATURE_VERSION
-from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, POLICY_VERSION, TEXTURE_POLICY_VERSION
+from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, RankedTextureFacePolicy, RANK_POLICY_VERSION, POLICY_VERSION, TEXTURE_POLICY_VERSION
 from nerf.refinement_texture import TEXTURE_FEATURE_VERSION, sobel_observation, target_sobel_mask
 
 
@@ -268,6 +268,33 @@ class MultiBranchTest(unittest.TestCase):
                              [POLICY_VERSION, TEXTURE_POLICY_VERSION])
             with np.load(texture_pair['branches'][1]['rounds'][0]['observation_graphs']['before']) as recorded:
                 self.assertEqual(recorded['node_features'].shape[1], 13)
+            categorical_path = os.path.join(directory, 'categorical.pt')
+            torch.save({'policy': RankedTextureFacePolicy().state_dict(), 'config': {
+                'checkpoint_sha256': file_sha256(checkpoint), 'mesh_sha256': file_sha256(mesh),
+                'feature_version': FEATURE_VERSION, 'policy_type': 'gnn', 'policy_architecture': RANK_POLICY_VERSION,
+                'action_mode': 'categorical', 'allow_stop': False, 'texture_feature_version': TEXTURE_FEATURE_VERSION,
+                'options': {'refine_candidate_mode': 'hybrid'}}}, categorical_path)
+            opt.refine_multibranch_policy = categorical_path
+            opt.refine_multibranch_compare_policy = gnn_path
+            model = Model(); trainer.model = model; trainer.global_step = 10; opt.refine = True
+            opt.refine_experiment_output = os.path.join(directory, 'categorical_compare')
+            os.mkdir(opt.refine_experiment_output)
+            with self.assertRaisesRegex(ValueError, 'requires --refine_multibranch_policy_mode rank'):
+                run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                                model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                                model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            opt.refine_multibranch_policy_mode = 'rank'
+            run_multibranch(trainer, Dataset(), Dataset(), [0], [1], copy.deepcopy(model.state_dict()),
+                            model.vertices.clone(), model.triangles.clone(), model.v_cumsum.copy(),
+                            model.f_cumsum.copy(), copy.deepcopy(trainer.scaler.state_dict()), 10)
+            with open(os.path.join(opt.refine_experiment_output, 'multibranch_comparison.json')) as source:
+                categorical_pair = json.load(source)
+            new_branch = categorical_pair['branches'][0]
+            self.assertEqual(new_branch['policy_evaluation_mode'], 'categorical_greedy')
+            self.assertEqual(new_branch['rounds'][0]['candidate_info']['candidate_mode'], 'hybrid')
+            self.assertEqual(new_branch['rounds'][0]['candidate_info']['fallback_count'], 0)
+            self.assertGreater(new_branch['actual_added_faces'], 0)
+            opt.refine_multibranch_policy_mode = 'threshold'
             opt.refine_multibranch_policy = policy_path
             opt.refine_multibranch_compare_policy = gnn_path
             low_mlp = CandidatePolicy()

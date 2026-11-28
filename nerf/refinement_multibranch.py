@@ -12,10 +12,10 @@ from scipy.ndimage import binary_erosion, distance_transform_edt
 from nerf.refinement_experiment import _select_views, _train_branch, _warmup_vertex_ema
 from nerf.refinement_multiround import _observe_silhouette, _region_stats, edge_costs, local_rewards
 from nerf.refinement_rl import FacePolicy, face_features, file_sha256
-from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, SequentialFaceDecisions, RankedFaceDecisions,
+from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, SequentialFaceDecisions, RankedFaceDecisions, CategoricalFaceDecisions,
                                         candidate_features, remap_vertex_ema, visibility_counts)
 from nerf.refinement_attribution import edge_outcomes
-from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, POLICY_VERSION, TEXTURE_POLICY_VERSION, policy_graph_state
+from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, RankedTextureFacePolicy, RANK_POLICY_VERSION, POLICY_VERSION, TEXTURE_POLICY_VERSION, policy_graph_state
 from nerf.refinement_texture import TEXTURE_FEATURE_VERSION, fixed_gradient_regions, texture_face_sums
 
 
@@ -41,11 +41,16 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
         raise ValueError('Unknown policy architecture in trajectory: {}'.format(kind))
     if kind == 'gnn':
         architecture = config.get('policy_architecture')
-        if architecture not in (POLICY_VERSION, TEXTURE_POLICY_VERSION) or config.get('feature_version') != FEATURE_VERSION:
+        if architecture not in (POLICY_VERSION, TEXTURE_POLICY_VERSION, RANK_POLICY_VERSION) or config.get('feature_version') != FEATURE_VERSION:
             raise ValueError('GNN checkpoint architecture or feature version mismatch')
-        if architecture == TEXTURE_POLICY_VERSION and config.get('texture_feature_version') != TEXTURE_FEATURE_VERSION:
+        if architecture in (TEXTURE_POLICY_VERSION, RANK_POLICY_VERSION) and config.get('texture_feature_version') != TEXTURE_FEATURE_VERSION:
             raise ValueError('Texture GNN feature version mismatch; retrain a compatible policy')
-        policy = TextureFacePolicy() if architecture == TEXTURE_POLICY_VERSION else SparseFacePolicy()
+        if architecture == RANK_POLICY_VERSION and config.get('action_mode') != 'categorical':
+            raise ValueError('Categorical GNN checkpoint action version mismatch')
+        if architecture != RANK_POLICY_VERSION and config.get('action_mode', 'bernoulli') != 'bernoulli':
+            raise ValueError('GNN checkpoint action distribution mismatch')
+        policy = RankedTextureFacePolicy() if architecture == RANK_POLICY_VERSION else TextureFacePolicy() if architecture == TEXTURE_POLICY_VERSION else SparseFacePolicy()
+        policy.allow_stop = config.get('allow_stop', False)
     else:
         if config.get('policy_architecture', 'candidate_mlp_v1') != 'candidate_mlp_v1':
             raise ValueError('MLP checkpoint architecture mismatch')
@@ -57,6 +62,9 @@ def load_trajectory_policy(path, checkpoint_hash, mesh_hash):
                                      'ema_beta': options.get('refine_gradient_ema_beta', 0.9),
                                      'training_ema_warmup_steps': options.get('refine_gradient_ema_warmup_steps', 0),
                                      'self_loops': options.get('refine_graph_self_loops', False)}
+        policy.candidate_settings.update(mode=options.get('refine_candidate_mode', 'area'),
+                                         area_fraction=options.get('refine_area_fraction', .4),
+                                         texture_fraction=options.get('refine_texture_fraction', .1))
         policy.training_objective = config.get('policy_objective', 'unknown')
         policy.training_reward_weights = config.get('weights')
     try:
@@ -186,17 +194,21 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     primary_policy = policy
     comparison_path = getattr(opt, 'refine_multibranch_compare_policy', '')
     comparison_policy = load_trajectory_policy(comparison_path, checkpoint_hash, mesh_hash) if comparison_path else None
+    if policy_mode != 'rank' and (isinstance(policy, RankedTextureFacePolicy) or isinstance(comparison_policy, RankedTextureFacePolicy)):
+        raise ValueError('Categorical checkpoint evaluation requires --refine_multibranch_policy_mode rank; it uses categorical greedy actions')
     if comparison_policy is not None:
         if (not isinstance(policy, CandidatePolicy) or not isinstance(comparison_policy, CandidatePolicy) or
                 type(policy) == type(comparison_policy)):
             raise ValueError('Policy comparison requires two different current policy architectures')
-        for key in ('fraction', 'min_area', 'ema_beta'):
+        for key in ('min_area', 'ema_beta'):
             if policy.candidate_settings[key] != comparison_policy.candidate_settings[key]:
                 raise ValueError('MLP and GNN candidate/EMA settings must match: ' + key)
     if getattr(opt, 'refine_observation_graph', False) and not isinstance(policy, CandidatePolicy):
         raise ValueError('Observation graph recording requires the current CandidatePolicy checkpoint')
     initial_policy = copy.deepcopy(policy.state_dict())
     use_texture_observation = (isinstance(policy, TextureFacePolicy) or isinstance(comparison_policy, TextureFacePolicy) or
+                               getattr(policy, 'candidate_settings', {}).get('mode') == 'hybrid' or
+                               getattr(comparison_policy, 'candidate_settings', {}).get('mode') == 'hybrid' or
                                getattr(opt, 'refine_multiround_grad_weight', 0.) > 0)
     comparison_initial = copy.deepcopy(comparison_policy.state_dict()) if comparison_policy is not None else None
     model = trainer.model
@@ -273,6 +285,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
               'selection_region_reward_note': 'local reward on pre-split selection-view regions; no policy updates or lineage return in evaluation',
               'training_indices': training_indices, 'training_seeds': training_seeds,
               'policy_evaluation_mode': policy_mode,
+              'primary_policy_action_mode': 'categorical_greedy' if isinstance(primary_policy, RankedTextureFacePolicy) else policy_mode,
               'rl_selection': 'descending shared policy score among visible faces',
               'high_error_selection': 'descending average RGB error among visible faces',
               'random_selection': 'seeded permutation of visible faces', 'branches': []}
@@ -285,7 +298,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     result['rl_policy_feature_version'] = FEATURE_VERSION if isinstance(policy, CandidatePolicy) else 'legacy_three_features'
     result['rl_vertex_ema_initialization'] = 'zeros on starting Stage 1 mesh followed by recorded warmup optimization steps'
     if isinstance(policy, CandidatePolicy):
-        result['rl_selection'] = ('highest current probability; rescore all untried candidates when budget changes; always request'
+        result['rl_selection'] = ('categorical greedy: highest current candidate/stop logit at each budget' if isinstance(policy, RankedTextureFacePolicy) else
+                                  'highest current probability; rescore all untried candidates when budget changes; always request'
                                   if policy_mode == 'rank' else
                                   'area order; sequential sigmoid >= 0.5 decisions using current remaining budget')
         result['rl_candidate_settings'] = policy.candidate_settings
@@ -300,9 +314,10 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
         restore()
         vertex_state = {'ema': warmup_state['ema'].copy(), 'seen': warmup_state['seen'].copy()}
         branch = {'method': method, 'random_seed': random_seed,
-                  'policy_evaluation_mode': (policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
+                  'policy_evaluation_mode': ('categorical_greedy' if isinstance(policy, RankedTextureFacePolicy) else policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
                   'policy_type': ('gnn' if isinstance(policy, SparseFacePolicy) else 'mlp') if is_rl else None,
-                  'policy_architecture': (TEXTURE_POLICY_VERSION if isinstance(policy, TextureFacePolicy) else POLICY_VERSION if isinstance(policy, SparseFacePolicy) else 'candidate_mlp_v1') if is_rl else None,
+                  'policy_architecture': (RANK_POLICY_VERSION if isinstance(policy, RankedTextureFacePolicy) else TEXTURE_POLICY_VERSION if isinstance(policy, TextureFacePolicy) else POLICY_VERSION if isinstance(policy, SparseFacePolicy) else 'candidate_mlp_v1') if is_rl else None,
+                  'candidate_rule': policy.candidate_settings if is_rl and isinstance(policy, CandidatePolicy) else ('all visible faces' if not is_rl else 'legacy visible faces'),
                   'policy_training_reward_weights': getattr(policy, 'training_reward_weights', None) if is_rl else None,
                   'initial_faces': len(model.triangles), 'initial_global_step': trainer.global_step,
                   'initial_metrics': initial_metrics, 'rounds': []}
@@ -330,6 +345,12 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             if is_rl and (len(visible) or isinstance(policy, CandidatePolicy)):
                 if isinstance(policy, CandidatePolicy):
                     _, _, view_counts = visibility_counts(observations, face_count)
+                    settings = policy.candidate_settings
+                    candidate_kw = dict(candidate_mode=settings['mode'], area_fraction=settings['area_fraction'],
+                                        texture_fraction=settings['texture_fraction'])
+                    if settings['mode'] == 'hybrid':
+                        _, tex_error, tex_pixels = texture_face_sums(observations, face_count)
+                        candidate_kw.update(texture_error_sum=tex_error, texture_pixels=tex_pixels)
                     graph_state = None
                     if getattr(opt, 'refine_observation_graph', False) or isinstance(policy, SparseFacePolicy):
                         from nerf.refinement_graph import build_face_graph, save_face_graph
@@ -337,7 +358,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                             vertices, faces, sums, counts, view_counts, len(selection_views),
                             vertex_state['ema'], vertex_state['seen'], round_budget, round_budget,
                             policy.candidate_settings['fraction'], policy.candidate_settings['min_area'],
-                            policy.candidate_settings['self_loops'] if isinstance(policy, SparseFacePolicy) else getattr(opt, 'refine_graph_self_loops', False))
+                            policy.candidate_settings['self_loops'] if isinstance(policy, SparseFacePolicy) else getattr(opt, 'refine_graph_self_loops', False), **candidate_kw)
                         if isinstance(policy, SparseFacePolicy):
                             if isinstance(policy, TextureFacePolicy):
                                 from nerf.refinement_graph import add_texture_features
@@ -353,9 +374,12 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                         visible, features, candidate_info = candidate_features(
                             vertices, faces, sums, counts, view_counts, len(selection_views),
                             vertex_state['ema'], vertex_state['seen'], 1.0 if round_budget else 0.0,
-                            policy.candidate_settings['fraction'], policy.candidate_settings['min_area'])
+                            policy.candidate_settings['fraction'], policy.candidate_settings['min_area'], **candidate_kw)
                     candidate_mask[visible] = True
-                    if policy_mode == 'rank':
+                    if isinstance(policy, RankedTextureFacePolicy):
+                        decisions = CategoricalFaceDecisions(policy, visible, features, round_budget, graph_state,
+                                                             deterministic=True, allow_stop=policy.allow_stop)
+                    elif policy_mode == 'rank':
                         decisions = RankedFaceDecisions(policy, visible, features, round_budget, graph=graph_state)
                         initial_probability[visible] = decisions.initial_probabilities
                     else:
@@ -381,6 +405,8 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                           max_added_faces=round_budget, decision_fn=decisions)
                 request_probability[visible] = decisions.probabilities
                 candidate_feature_values[visible] = decisions.features
+                if isinstance(decisions, CategoricalFaceDecisions):
+                    initial_probability[visible] = decisions.initial_probabilities
             event = copy.deepcopy(model.refinement_event)
             actual = len(model.triangles) - face_count
             if actual != event['added_faces'] or actual > round_budget:
@@ -397,7 +423,7 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             status[visible] = 'hold' if is_rl and isinstance(policy, CandidatePolicy) else 'budget_not_considered'
             status[order] = 'budget_not_considered'
             considered_faces = event.get('considered_faces', order[:event['considered_count']])
-            for face in considered_faces:
+            for face in order:
                 status[face] = event['request_status'][int(face)]
             passive = np.zeros(face_count, dtype=bool)
             passive[event['passive_faces']] = True
@@ -410,11 +436,15 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
             after_selection = _observe_silhouette(trainer, val_data, selection_views, texture=use_texture_observation)
             if graph_files is not None:
                 post_sums, post_pixels, post_views = visibility_counts(after_selection, len(model.triangles))
+                post_kw = dict(candidate_mode=settings['mode'], area_fraction=settings['area_fraction'], texture_fraction=settings['texture_fraction'])
+                if settings['mode'] == 'hybrid':
+                    _, post_texture, post_texture_pixels = texture_face_sums(after_selection, len(model.triangles))
+                    post_kw.update(texture_error_sum=post_texture, texture_pixels=post_texture_pixels)
                 post_graph, _, _, _ = build_face_graph(
                     (model.vertices + model.vertices_offsets.detach()).cpu().numpy(), model.triangles.cpu().numpy(),
                     post_sums, post_pixels, post_views, len(selection_views), vertex_state['ema'], vertex_state['seen'],
                     round_budget - actual, round_budget, policy.candidate_settings['fraction'],
-                    policy.candidate_settings['min_area'], policy.candidate_settings['self_loops'] if isinstance(policy, SparseFacePolicy) else getattr(opt, 'refine_graph_self_loops', False))
+                    policy.candidate_settings['min_area'], policy.candidate_settings['self_loops'] if isinstance(policy, SparseFacePolicy) else getattr(opt, 'refine_graph_self_loops', False), **post_kw)
                 if isinstance(policy, TextureFacePolicy):
                     add_texture_features(post_graph, after_selection)
                 post_graph['metadata']['policy'] = 'shared ' + ('gnn' if isinstance(policy, SparseFacePolicy) else 'mlp') + ' policy'
@@ -458,7 +488,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                                               texture=True, texture_target_mask=True),
                                          evaluation_views, shapes, gradient_masks)
             branch['rounds'].append({'round': round_index + 1, 'faces_before': face_count,
-                                     'policy_evaluation_mode': (policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
+                                     'policy_evaluation_mode': ('categorical_greedy' if isinstance(policy, RankedTextureFacePolicy) else policy_mode if isinstance(policy, CandidatePolicy) else 'legacy_rank') if is_rl else None,
+                                     'stop_event': getattr(decisions, 'stop_event', None),
+                                     'stopped_count': sum(event['request_status'][int(face)] == 'stopped' for face in order),
                                      'initial_candidate_probability_distribution': probability_distribution(initial_probability) if decisions is not None else None,
                                      'attempted_probability_distribution': probability_distribution(decisions.probabilities[decisions.decided]) if decisions is not None else None,
                                      'faces_after': len(model.triangles), 'visible_candidates': len(visible),

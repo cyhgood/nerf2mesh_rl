@@ -7,18 +7,20 @@ import os
 import numpy as np
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from scipy.ndimage import distance_transform_edt
 
 from nerf.refinement_experiment import _fixed_region_means, _observe, _select_views, _train_branch, _warmup_vertex_ema
 from nerf.refinement_rl import file_sha256
 from nerf.refinement_candidates import (CandidatePolicy, FEATURE_VERSION, candidate_features,
-                                        remap_vertex_ema, visibility_counts, SequentialFaceDecisions)
+                                        remap_vertex_ema, visibility_counts, SequentialFaceDecisions, CategoricalFaceDecisions)
 from nerf.refinement_attribution import edge_outcomes
-from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, TEXTURE_POLICY_VERSION, policy_graph_state
-from nerf.refinement_texture import fixed_gradient_regions, TEXTURE_FEATURE_VERSION, TEXTURE_DEFINITION
+from nerf.refinement_gnn import SparseFacePolicy, TextureFacePolicy, RankedTextureFacePolicy, RANK_POLICY_VERSION, TEXTURE_POLICY_VERSION, policy_graph_state
+from nerf.refinement_texture import fixed_gradient_regions, texture_face_sums, TEXTURE_FEATURE_VERSION, TEXTURE_DEFINITION
 
 
 POLICY_OBJECTIVE = 'candidate_sequential_budget_stop_v5'
+CATEGORICAL_OBJECTIVE = 'candidate_categorical_budget_v1'
 REWARD_VERSION = 'partial_observation_components_v2'
 REWARD_REASON_CODES = {'valid': 0, 'no_pixels': 1, 'nonfinite_before': 2,
                        'nonfinite_after': 3, 'invalid_cost': 4, 'invalid_pixel_count': 5}
@@ -145,6 +147,90 @@ def face_policy_losses(policy, transitions, returns, baseline='none', scale='non
     return (losses, stats) if return_stats else losses
 
 
+def categorical_policy_losses(policy, transitions, returns, baseline='none', scale='none', clip=0.0):
+    """Replay without-replacement categorical decisions using their exact denominators."""
+    losses, stats = [], []
+    for transition, face_returns in zip(transitions, returns):
+        visible = np.asarray(transition['visible'], dtype=np.int64)
+        if not len(visible):
+            losses.append(None); stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
+            continue
+        graph = transition['policy_graph']
+        mapping = np.asarray(graph['face_to_node'])[visible]
+        if np.any(mapping < 0) or not np.array_equal(np.asarray(graph['node_to_face'])[mapping], visible):
+            raise ValueError('Categorical replay graph/face mapping mismatch')
+        embeddings = policy.encode(graph)[torch.as_tensor(mapping, dtype=torch.long)]
+        positions = {int(face): i for i, face in enumerate(visible)}
+        alive = np.ones(len(visible), dtype=bool)
+        passive = set(map(int, transition['event']['passive_faces']))
+        edges = {int(e['requester_face']): e for e in transition['event']['edge_events']}
+        logps, credits = [], []
+        steps = list(map(int, transition['decision_order']))
+        stop = transition.get('stop_event')
+        if stop is not None:
+            steps.append(None)
+        for face in steps:
+            if face is None:
+                budget = stop['remaining'] / transition['round_budget']
+            else:
+                idx = positions[face]
+                if not alive[idx]:
+                    raise ValueError('Repeated categorical action in trajectory')
+                budget = transition['remaining_budget'][idx] / transition['round_budget']
+            active = np.flatnonzero(alive)
+            if face is None:
+                if not transition.get('allow_stop', False):
+                    raise ValueError('Recorded stop without stop action')
+                chosen = len(active)
+                remaining_faces = visible[active]
+                remaining_faces = remaining_faces[~np.isin(remaining_faces, list(passive))]
+                observed = face_returns[remaining_faces]
+                observed = observed[np.isfinite(observed)]
+                credit = float(observed.mean()) if len(observed) else np.nan
+            else:
+                chosen = int(np.flatnonzero(active == idx)[0])
+                own = face_returns[face]
+                if np.isfinite(own):
+                    # Rejected and already-passive requests have no direct split credit.
+                    credit = float(own) if face in edges else 0.
+                    if face in edges:
+                        for neighbor in edges[face]['affected_faces']:
+                            if int(neighbor) in passive and np.isfinite(face_returns[int(neighbor)]):
+                                credit += float(face_returns[int(neighbor)])
+                else:
+                    credit = np.nan
+                alive[idx] = False
+            if np.isfinite(credit):
+                # Recompute the action head during backward instead of retaining
+                # all candidate activations for every decision on a large mesh.
+                def step_log_probability(hidden, active_tensor, budget_tensor,
+                                         choice=chosen, include_stop=transition.get('allow_stop', False)):
+                    fraction = budget_tensor.reshape(())
+                    scores = policy.score(hidden[active_tensor], fraction.expand(len(active_tensor)))
+                    if include_stop:
+                        scores = torch.cat((scores, policy.stop_score(fraction).reshape(1)))
+                    return torch.log_softmax(scores, dim=0)[choice]
+                logps.append(checkpoint(step_log_probability, embeddings, torch.as_tensor(active, dtype=torch.long),
+                                        torch.tensor(budget, dtype=torch.float32)))
+                credits.append(credit)
+        if not credits:
+            losses.append(None); stats.append({'raw': _distribution([]), 'processed': _distribution([]), 'baseline': None, 'scale': None})
+            continue
+        raw = np.asarray(credits, dtype=np.float64)
+        baseline_value = float(raw.mean()) if baseline == 'mean' else 0.
+        advantages = raw - baseline_value
+        scale_value = float(advantages.std()) if scale == 'std' else 1.
+        if scale_value < 1e-8:
+            scale_value = 1.
+        advantages /= scale_value
+        if clip > 0:
+            advantages = np.clip(advantages, -clip, clip)
+        losses.append(-(torch.stack(logps) * torch.as_tensor(advantages, dtype=torch.float32)).sum())
+        stats.append({'raw': _distribution(raw), 'processed': _distribution(advantages),
+                      'baseline': baseline_value, 'scale': scale_value})
+    return losses, stats
+
+
 def _distribution(values):
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
@@ -226,9 +312,10 @@ def grouped_rewards(transition, weights, returns=None):
                   if status in ('conflict', 'budget', 'already_split')}
     not_considered = {int(face) for face, status in event['request_status'].items()
                       if status == 'budget_not_considered'}
+    stopped = {int(face) for face, status in event['request_status'].items() if status == 'stopped'}
     result = {}
     for name, faces in [('executed', executed), ('passive', passive),
-                        ('unexecuted', unexecuted), ('not_considered', not_considered)]:
+                        ('unexecuted', unexecuted), ('not_considered', not_considered), ('stopped', stopped)]:
         result[name] = {'faces': len(faces), 'same_valid_set': reward_distributions(transition, weights, returns, faces),
                         'independent_components': component_distributions(transition, faces)}
     return result
@@ -247,6 +334,7 @@ def action_counts(transition):
             'conflict_count': statuses.count('conflict'),
             'budget_rejected_count': statuses.count('budget'),
             'budget_not_considered_count': statuses.count('budget_not_considered'),
+            'stopped_count': statuses.count('stopped'),
             'already_split_count': statuses.count('already_split')}
 
 
@@ -327,6 +415,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     advantage_scale = getattr(opt, 'refine_advantage_scale', 'std')
     advantage_clip = getattr(opt, 'refine_advantage_clip', 5.0)
     candidate_fraction = getattr(opt, 'refine_candidate_fraction', 0.5)
+    candidate_mode = getattr(opt, 'refine_candidate_mode', 'area')
+    area_fraction = getattr(opt, 'refine_area_fraction', .4)
+    texture_fraction = getattr(opt, 'refine_texture_fraction', .1)
+    action_mode = getattr(opt, 'refine_action_mode', 'bernoulli')
+    allow_stop = getattr(opt, 'refine_rank_stop', False)
     min_area = getattr(opt, 'refine_min_face_area', 1e-12)
     ema_beta = getattr(opt, 'refine_gradient_ema_beta', 0.9)
     warmup_steps = getattr(opt, 'refine_gradient_ema_warmup_steps', 0)
@@ -354,6 +447,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     policy_type = getattr(opt, 'refine_policy', 'mlp')
     if policy_type not in ('mlp', 'gnn'):
         raise ValueError('Unknown Stage 1 policy type')
+    if action_mode not in ('bernoulli', 'categorical') or (action_mode == 'categorical' and policy_type != 'gnn') or (allow_stop and action_mode != 'categorical'):
+        raise ValueError('Categorical selection requires GNN; stop requires categorical selection')
+    if candidate_mode not in ('area', 'hybrid') or not 0 < area_fraction + texture_fraction <= 1 or min(area_fraction, texture_fraction) < 0:
+        raise ValueError('Invalid candidate mode or hybrid fractions')
+    policy_objective = CATEGORICAL_OBJECTIVE if action_mode == 'categorical' else POLICY_OBJECTIVE
     config = {'checkpoint': os.path.abspath(opt.ckpt), 'mesh': os.path.abspath(opt.mesh),
               'checkpoint_sha256': file_sha256(opt.ckpt), 'mesh_sha256': file_sha256(opt.mesh),
               'selection_views': selection_views, 'reward_views': reward_views,
@@ -370,11 +468,12 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
               'pixel_regions': 'pre-update face index; uncovered target pixels assigned to nearest face within radius for silhouette',
               'lineage_weights': 'child area after optimization normalized over each parent',
               'cost_allocation': 'all faces added by an edge charged once to its first executing requester',
-              'policy_objective': POLICY_OBJECTIVE,
-              'budget_decision_mode': 'area order, sequential remaining/per-round budget, stop sampling at zero',
+              'policy_objective': policy_objective,
+              'budget_decision_mode': ('categorical without replacement with current budget' if action_mode == 'categorical' else 'area order, sequential remaining/per-round budget, stop sampling at zero'),
               'feature_version': FEATURE_VERSION,
               'policy_type': policy_type,
-              'policy_architecture': TEXTURE_POLICY_VERSION if policy_type == 'gnn' else 'candidate_mlp_v1',
+              'policy_architecture': (RANK_POLICY_VERSION if action_mode == 'categorical' else TEXTURE_POLICY_VERSION) if policy_type == 'gnn' else 'candidate_mlp_v1',
+              'action_mode': action_mode, 'allow_stop': bool(allow_stop),
               'texture_feature_version': TEXTURE_FEATURE_VERSION if policy_type == 'gnn' else None,
               'texture_definition': TEXTURE_DEFINITION if policy_type == 'gnn' or weights[3] > 0 else None,
               'advantage_config': {'baseline': advantage_baseline, 'scale': advantage_scale, 'clip': advantage_clip},
@@ -387,7 +486,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         config['stage1_depth_source'] = Stage1DepthSource(opt.stage1_depth_manifest).describe()
     model = trainer.model
     torch.manual_seed(opt.seed)
-    policy = TextureFacePolicy() if policy_type == 'gnn' else CandidatePolicy()
+    policy = (RankedTextureFacePolicy() if action_mode == 'categorical' else TextureFacePolicy()) if policy_type == 'gnn' else CandidatePolicy()
     optimizer = torch.optim.Adam(policy.parameters(), lr=opt.refine_rl_lr)
     generator = torch.Generator().manual_seed(opt.seed)
     transitions = []
@@ -403,6 +502,12 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         saved = torch.load(opt.refine_multiround_resume, map_location='cpu')
         old_config = dict(saved['config'])
         requested_config = dict(config)
+        old_action_mode = old_config.pop('action_mode', 'bernoulli')
+        old_stop = old_config.pop('allow_stop', False)
+        requested_config.pop('action_mode')
+        requested_config.pop('allow_stop')
+        if old_action_mode != action_mode or old_stop != allow_stop:
+            raise ValueError('Action distribution mismatch; start a new policy from Stage 1')
         old_reward_version = old_config.pop('reward_version', 'strict_observations_v1')
         requested_config.pop('reward_version')
         old_config.pop('reward_missing_rule', None)
@@ -444,6 +549,10 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             raise ValueError('Texture feature version mismatch: old GNN checkpoint cannot resume; retrain the texture GNN')
         old_options = dict(old_config.get('options', {}))
         requested_options = dict(requested_config.get('options', {}))
+        for key, default in [('refine_candidate_mode', 'area'), ('refine_area_fraction', .4),
+                             ('refine_texture_fraction', .1), ('refine_action_mode', 'bernoulli'), ('refine_rank_stop', False)]:
+            if key not in old_options and requested_options.get(key, default) == default:
+                requested_options.pop(key, None)
         if saved['completed']:
             for key in ('refine_multiround_sil_weight', 'refine_multiround_rgb_weight',
                         'refine_multiround_face_cost', 'refine_multiround_grad_weight'):
@@ -495,7 +604,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         requested_config.pop('feature_version')
         requested_config.pop('horizon')
         requested_config.pop('silhouette_radius')
-        if not saved['completed'] and old_objective != POLICY_OBJECTIVE:
+        if not saved['completed'] and old_objective != policy_objective:
             raise ValueError('Cannot resume an open segment from a different policy objective; '
                              'resume a completed checkpoint or start from Stage 1')
         if old_feature_version != FEATURE_VERSION and not getattr(opt, 'refine_reinitialize_legacy_policy', False):
@@ -503,7 +612,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         if saved['completed']:
             old_config.pop('pixel_regions', None)
             requested_config.pop('pixel_regions', None)
-        if saved['completed'] and old_objective != POLICY_OBJECTIVE:
+        if saved['completed'] and old_objective != policy_objective:
             old_config.pop('advantage_config', None)
             requested_config.pop('advantage_config', None)
             old_config.pop('lineage_missing_rule', None)
@@ -522,7 +631,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             old_config['options'], requested_config['options'] = old_options, new_options
         if (old_config != requested_config or
                 (not saved['completed'] and (old_horizon != horizon or old_radius != radius or
-                                              old_objective != POLICY_OBJECTIVE))):
+                                              old_objective != policy_objective))):
             raise ValueError('Resume checkpoint configuration or input file hashes differ')
         model.vertices = saved['vertices'].to(trainer.device)
         model.triangles = saved['triangles'].to(trainer.device)
@@ -541,7 +650,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         if old_feature_version == FEATURE_VERSION:
             policy.load_state_dict(saved['policy'])
         if old_feature_version == FEATURE_VERSION:
-            if old_objective == POLICY_OBJECTIVE and not reward_changed:
+            if old_objective == policy_objective and not reward_changed:
                 optimizer.load_state_dict(saved['policy_optimizer'])
             else:
                 trainer.log('[INFO] policy objective or reward changed; retained policy and EMA with a fresh policy optimizer')
@@ -592,12 +701,17 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
     target_round = min(horizon, len(transitions) + opt.refine_multiround_rounds)
     for t in range(len(transitions), target_round):
         count = len(model.triangles)
-        use_texture = policy_type == 'gnn'
+        use_texture = policy_type == 'gnn' or candidate_mode == 'hybrid'
         observe_gradient_reward = use_texture or weights[3] > 0
         selection = _observe(trainer, val_data, selection_views, texture=use_texture)
         before = _observe_silhouette(trainer, train_data, reward_views, training_dataset=True, texture=observe_gradient_reward)
         evaluation_before = _observe_silhouette(trainer, val_data, evaluation_views)
         sums, observations, view_counts = visibility_counts(selection, count)
+        texture_sum = texture_pixels = None
+        if candidate_mode == 'hybrid':
+            _, texture_sum, texture_pixels = texture_face_sums(selection, count)
+        candidate_kw = dict(candidate_mode=candidate_mode, area_fraction=area_fraction,
+                            texture_fraction=texture_fraction, texture_error_sum=texture_sum, texture_pixels=texture_pixels)
         model.triangles_errors = torch.tensor(sums, dtype=torch.float32, device=trainer.device)
         model.triangles_errors_cnt = torch.tensor(observations, dtype=torch.float32, device=trainer.device)
         current_vertices = (model.vertices + model.vertices_offsets.detach()).cpu().numpy()
@@ -609,7 +723,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                 current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
                 len(selection_views), vertex_state['ema'], vertex_state['seen'],
                 opt.refine_face_budget, opt.refine_face_budget, candidate_fraction, min_area,
-                getattr(opt, 'refine_graph_self_loops', False))
+                getattr(opt, 'refine_graph_self_loops', False), **candidate_kw)
             if policy_type == 'gnn':
                 from nerf.refinement_graph import add_texture_features
                 add_texture_features(graph, selection)
@@ -624,8 +738,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
             visible, features, feature_info = candidate_features(
                 current_vertices, model.triangles.cpu().numpy(), sums, observations, view_counts,
                 len(selection_views), vertex_state['ema'], vertex_state['seen'], 1.0,
-                candidate_fraction, min_area)
-        decisions = SequentialFaceDecisions(policy, visible, features, opt.refine_face_budget, generator=generator, graph=graph_state)
+                candidate_fraction, min_area, **candidate_kw)
+        decisions = (CategoricalFaceDecisions(policy, visible, features, opt.refine_face_budget, graph_state,
+                                             generator=generator, allow_stop=allow_stop)
+                     if action_mode == 'categorical' else
+                     SequentialFaceDecisions(policy, visible, features, opt.refine_face_budget, generator=generator, graph=graph_state))
         model.refine_and_decimate(export_mesh=False, candidate_order=visible,
                                   max_added_faces=opt.refine_face_budget, decision_fn=decisions)
         event = copy.deepcopy(model.refinement_event)
@@ -644,12 +761,16 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         if graph_files is not None:
             updated_selection = _observe(trainer, val_data, selection_views, texture=use_texture)
             updated_sums, updated_pixels, updated_views = visibility_counts(updated_selection, len(model.triangles))
+            updated_kw = dict(candidate_mode=candidate_mode, area_fraction=area_fraction, texture_fraction=texture_fraction)
+            if candidate_mode == 'hybrid':
+                _, updated_texture, updated_texture_pixels = texture_face_sums(updated_selection, len(model.triangles))
+                updated_kw.update(texture_error_sum=updated_texture, texture_pixels=updated_texture_pixels)
             updated_graph, _, _, _ = build_face_graph(
                 (model.vertices + model.vertices_offsets.detach()).cpu().numpy(), model.triangles.cpu().numpy(),
                 updated_sums, updated_pixels, updated_views, len(selection_views), vertex_state['ema'],
                 vertex_state['seen'], opt.refine_face_budget - event['added_faces'], opt.refine_face_budget,
-                candidate_fraction, min_area, getattr(opt, 'refine_graph_self_loops', False))
-            if use_texture:
+                candidate_fraction, min_area, getattr(opt, 'refine_graph_self_loops', False), **updated_kw)
+            if policy_type == 'gnn':
                 add_texture_features(updated_graph, updated_selection)
             updated_graph['metadata']['policy'] = 'shared ' + policy_type + ' policy'
             save_face_graph(graph_files['after'], updated_graph, parents)
@@ -691,7 +812,8 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                             'policy_graph': graph_state,
                             'actions': actions, 'probabilities': decisions.probabilities,
                             'decision_mask': decisions.decided, 'decision_log_probabilities': decisions.log_probabilities,
-                            'decision_order': visible[decisions.decided].copy(), 'round_budget': opt.refine_face_budget,
+                            'decision_order': np.asarray(event['considered_faces'], dtype=np.int64), 'round_budget': opt.refine_face_budget,
+                            'action_mode': action_mode, 'allow_stop': allow_stop, 'stop_event': getattr(decisions, 'stop_event', None),
                             'remaining_budget': decisions.remaining, 'considered_count': considered_count,
                             'parent_face_id': parents, 'child_areas': child_areas, 'costs': costs,
                             'reward_pixels': pixel_counts, 'silhouette_pixels': sil_counts, 'rgb_before': rgb_before, 'rgb_after': rgb_after,
@@ -716,6 +838,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                       'probabilities': _json_values(transition['probabilities']),
                       'decision_mask': transition['decision_mask'].tolist(),
                       'decision_order': transition['decision_order'].tolist(), 'round_budget': transition['round_budget'],
+                      'action_mode': transition.get('action_mode', 'bernoulli'), 'stop_event': transition.get('stop_event'),
                       'decision_log_probabilities': _json_values(transition['decision_log_probabilities']),
                       'remaining_budget': transition['remaining_budget'].tolist(),
                       'candidate_info': transition['candidate_info'],
@@ -751,8 +874,11 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
         return
 
     returns, child_stats = lineage_returns(transitions, opt.refine_multiround_gamma, return_missing=True)
-    losses, advantage_stats = face_policy_losses(policy, transitions, returns, advantage_baseline,
-                                                 advantage_scale, advantage_clip, return_stats=True)
+    if action_mode == 'categorical':
+        losses, advantage_stats = categorical_policy_losses(policy, transitions, returns, advantage_baseline, advantage_scale, advantage_clip)
+    else:
+        losses, advantage_stats = face_policy_losses(policy, transitions, returns, advantage_baseline,
+                                                     advantage_scale, advantage_clip, return_stats=True)
     valid_losses = [loss for loss in losses if loss is not None]
     if valid_losses:
         optimizer.zero_grad()
@@ -793,6 +919,7 @@ def run_multiround(trainer, train_data, val_data, selection_views, evaluation_vi
                   'probabilities': _json_values(transition['probabilities']),
                   'decision_mask': transition['decision_mask'].tolist(),
                   'decision_order': transition['decision_order'].tolist(), 'round_budget': transition['round_budget'],
+                  'action_mode': transition.get('action_mode', 'bernoulli'), 'stop_event': transition.get('stop_event'),
                   'decision_log_probabilities': _json_values(transition['decision_log_probabilities']),
                   'remaining_budget': transition['remaining_budget'].tolist(),
                   'candidate_info': transition['candidate_info'],

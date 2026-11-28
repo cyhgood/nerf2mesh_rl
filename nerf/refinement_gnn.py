@@ -10,6 +10,7 @@ from nerf.refinement_candidates import CandidatePolicy
 
 POLICY_VERSION = 'face_gnn_two_layer_v1'
 TEXTURE_POLICY_VERSION = 'face_gnn_two_layer_texture_v2'
+RANK_POLICY_VERSION = 'face_gnn_texture_categorical_v3'
 GRAPH_KEYS = ('node_features', 'edge_index', 'edge_features', 'edge_feature_valid', 'face_to_node', 'node_to_face')
 
 
@@ -79,3 +80,14 @@ class TextureFacePolicy(SparseFacePolicy):
         if graph.get('texture_feature_version') != TEXTURE_FEATURE_VERSION or graph['node_features'].shape[1] != 13:
             raise ValueError('Texture GNN requires the matching Sobel graph feature version; retrain incompatible policies')
         return super().encode(graph)
+
+
+class RankedTextureFacePolicy(TextureFacePolicy):
+    def __init__(self):
+        super().__init__()
+        self.stop_head = nn.Linear(1, 1)
+        nn.init.zeros_(self.stop_head.weight)
+        nn.init.constant_(self.stop_head.bias, -2.)
+
+    def stop_score(self, budget):
+        return self.stop_head(torch.as_tensor(budget, dtype=torch.float32).reshape(1, 1)).reshape(())

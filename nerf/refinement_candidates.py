@@ -134,6 +134,69 @@ class RankedFaceDecisions(SequentialFaceDecisions):
         return True
 
 
+class CategoricalFaceDecisions(SequentialFaceDecisions):
+    """Sample a candidate without replacement; optional stop is an extra categorical action."""
+    def __init__(self, policy, candidates, features, budget, graph, generator=None,
+                 deterministic=False, allow_stop=False):
+        super().__init__(policy, candidates, features, budget, generator, deterministic, graph)
+        self.candidates = np.asarray(candidates, dtype=np.int64)
+        self.allow_stop = allow_stop
+        self.decision_order = []
+        self.stop_event = None
+        self._pending = None
+        self._cached_budget = None
+        self._cached_logits = None
+        self._cached_stop = None
+        self.initial_probabilities = np.full(len(candidates), np.nan)
+
+    def next_candidate(self, remaining):
+        indices = np.flatnonzero(~self.decided)
+        if not len(indices) or remaining <= 0:
+            raise ValueError('No candidate or budget remains')
+        fraction = remaining / self.budget
+        with torch.no_grad():
+            if self._cached_budget != remaining:
+                self._cached_logits = self.policy.score(self.embeddings, np.full(len(self.candidates), fraction, dtype=np.float32))
+                self._cached_stop = self.policy.stop_score(fraction).reshape(1) if self.allow_stop else None
+                self._cached_budget = remaining
+            logits = self._cached_logits[torch.as_tensor(indices)]
+            if self.allow_stop:
+                logits = torch.cat((logits, self._cached_stop))
+            if not torch.isfinite(logits).all():
+                raise ValueError('Categorical policy produced nonfinite logits')
+            log_prob = torch.log_softmax(logits, dim=0)
+            if not self.decision_order:
+                self.initial_probabilities[indices] = log_prob[:len(indices)].exp().cpu().numpy()
+            if self.deterministic:
+                # Candidate IDs break score ties; stop comes after candidates in ties.
+                best = logits.max()
+                tied = np.flatnonzero((logits == best).cpu().numpy())
+                available = tied[tied < len(indices)]
+                choice = int(available[np.argmin(self.candidates[indices[available]])]) if len(available) else int(tied[0])
+            else:
+                choice = int(torch.multinomial(log_prob.exp(), 1, generator=self.generator).item())
+            if choice == len(indices):
+                self.stop_event = {'remaining': remaining, 'probability': float(log_prob[choice].exp()),
+                                   'log_probability': float(log_prob[choice]), 'remaining_candidates': len(indices)}
+                return None
+            index = int(indices[choice])
+            self._pending = (index, remaining, float(log_prob[choice].exp()), float(log_prob[choice]))
+            return int(self.candidates[index])
+
+    def __call__(self, face_id, remaining):
+        index, expected, probability, log_probability = self._pending
+        if self.positions[face_id] != index or expected != remaining or self.decided[index]:
+            raise ValueError('Categorical action does not match sampled state')
+        self.features[index, 6] = remaining / self.budget
+        self.actions[index] = self.decided[index] = True
+        self.probabilities[index] = probability
+        self.log_probabilities[index] = log_probability
+        self.remaining[index] = remaining
+        self.decision_order.append(int(face_id))
+        self._pending = None
+        return True
+
+
 def visibility_counts(observations, face_count):
     sums = np.zeros(face_count, dtype=np.float64)
     pixels = np.zeros(face_count, dtype=np.int64)
@@ -178,7 +241,9 @@ def normal_angles(vertices, faces, min_area):
 
 
 def candidate_features(vertices, faces, sums, pixels, view_counts, num_views,
-                       vertex_ema, vertex_seen, budget_fraction, fraction=0.5, min_area=1e-12):
+                       vertex_ema, vertex_seen, budget_fraction, fraction=0.5, min_area=1e-12,
+                       candidate_mode='area', area_fraction=.4, texture_fraction=.1,
+                       texture_error_sum=None, texture_pixels=None):
     if not 0 < fraction <= 1 or not np.isfinite(min_area) or min_area < 0:
         raise ValueError('Candidate fraction must be in (0,1] and minimum area nonnegative')
     if len(vertex_ema) != len(vertices) or len(vertex_seen) != len(vertices):
@@ -189,7 +254,32 @@ def candidate_features(vertices, faces, sums, pixels, view_counts, num_views,
     valid = (pixels > 0) & np.isfinite(areas) & (areas > min_area) & np.isfinite(sums)
     ids = np.flatnonzero(valid)
     order = np.lexsort((ids, -areas[ids]))
-    candidates = ids[order[:int(np.ceil(len(ids) * fraction))]]
+    ranked_area = ids[order]
+    if candidate_mode == 'area':
+        area_ids = ranked_area[:int(np.ceil(len(ids) * fraction))]
+        texture_ids = fallback_ids = np.empty(0, dtype=np.int64)
+    elif candidate_mode == 'hybrid':
+        if (not np.isfinite(area_fraction) or not np.isfinite(texture_fraction) or area_fraction < 0 or
+                texture_fraction < 0 or not 0 < area_fraction + texture_fraction <= 1):
+            raise ValueError('Hybrid fractions must be nonnegative and sum to (0, 1]')
+        if texture_error_sum is None or texture_pixels is None:
+            raise ValueError('Hybrid candidates require texture error observations')
+        texture_error_sum = np.asarray(texture_error_sum)
+        texture_pixels = np.asarray(texture_pixels)
+        if texture_error_sum.shape != (len(faces),) or texture_pixels.shape != (len(faces),):
+            raise ValueError('Texture observations must match face count')
+        target = int(np.ceil(len(ids) * (area_fraction + texture_fraction)))
+        area_ids = ranked_area[:min(target, int(np.ceil(len(ids) * area_fraction)))]
+        remaining = ranked_area[len(area_ids):]
+        texture_valid = (texture_pixels[remaining] > 0) & np.isfinite(texture_error_sum[remaining])
+        possible = remaining[texture_valid]
+        means = texture_error_sum[possible] / texture_pixels[possible]
+        sorted_texture = possible[np.lexsort((possible, -means))]
+        texture_ids = sorted_texture[:target - len(area_ids)]
+        fallback_ids = remaining[~np.isin(remaining, texture_ids)][:target - len(area_ids) - len(texture_ids)]
+    else:
+        raise ValueError('Unknown candidate mode')
+    candidates = np.concatenate((area_ids, texture_ids, fallback_ids))
     gradient_valid = (vertex_seen[faces] & np.isfinite(vertex_ema[faces]) & (vertex_ema[faces] >= 0)).all(axis=1)
     gradients = np.mean(vertex_ema[faces], axis=1)
     gradients[~gradient_valid] = 0.
@@ -202,6 +292,10 @@ def candidate_features(vertices, faces, sums, pixels, view_counts, num_views,
                                 ~gradient_valid[candidates], ~angle_valid[candidates])).astype(np.float32)
     total_error = float(sums[ids].sum())
     info = {'valid_faces': int(len(ids)), 'candidate_faces': int(len(candidates)),
+            'candidate_mode': candidate_mode, 'area_fraction': float(area_fraction),
+            'texture_fraction': float(texture_fraction), 'area_count': len(area_ids),
+            'texture_count': len(texture_ids), 'fallback_count': len(fallback_ids),
+            'candidate_ids': candidates.tolist(),
             'candidate_rgb_error_sum': float(sums[candidates].sum()),
             'valid_rgb_error_sum': total_error,
             'candidate_rgb_error_coverage': float(sums[candidates].sum() / total_error) if total_error > 0 else None,
@@ -209,6 +303,16 @@ def candidate_features(vertices, faces, sums, pixels, view_counts, num_views,
             'feature_definitions': FEATURE_DEFINITIONS, 'round_budget_fraction': float(budget_fraction),
             'gradient_missing': int((~gradient_valid[candidates]).sum()),
             'curvature_missing': int((~angle_valid[candidates]).sum())}
+    if candidate_mode == 'hybrid':
+        total_texture = float(texture_error_sum[ids][(texture_pixels[ids] > 0) & np.isfinite(texture_error_sum[ids])].sum())
+        info['groups'] = {}
+        for label, group in [('area', area_ids), ('texture', texture_ids), ('fallback', fallback_ids)]:
+            valid_texture = group[(texture_pixels[group] > 0) & np.isfinite(texture_error_sum[group])]
+            info['groups'][label] = {'face_ids': group.tolist(), 'rgb_error_sum': float(sums[group].sum()),
+                                     'rgb_error_coverage': float(sums[group].sum() / total_error) if total_error > 0 else None,
+                                     'texture_error_sum': float(texture_error_sum[valid_texture].sum()),
+                                     'texture_error_coverage': float(texture_error_sum[valid_texture].sum() / total_texture) if total_texture > 0 else None,
+                                     'texture_observed_faces': len(valid_texture)}
     return candidates, features, info
 
 
