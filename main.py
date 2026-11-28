@@ -1,5 +1,6 @@
 import torch
 import argparse
+import math
 
 from nerf.gui import NeRFGUI
 from nerf.network import NeRFNetwork
@@ -83,6 +84,13 @@ if __name__ == '__main__':
     parser.add_argument('--wo_smooth', action='store_true', help="disable all smoothness regularizations")
     parser.add_argument('--lambda_lpips', type=float, default=0, help="loss scale")
     parser.add_argument('--lambda_offsets', type=float, default=0.1, help="loss scale")#顶点偏移L2正则化
+    parser.add_argument('--lambda_sil', type=float, default=0, help='Stage 1 full-image silhouette L1 loss weight')
+    parser.add_argument('--lambda_image_grad', type=float, default=0, help='Stage 1 foreground image Sobel gradient loss weight')
+    parser.add_argument('--lambda_texture_weighted_grad', type=float, default=0, help='Stage 1 texture-weighted Sobel loss coefficient')
+    parser.add_argument('--texture_gradient_gain', type=float, default=1.0, help='target gradient weight gain')
+    parser.add_argument('--texture_gradient_weight_cap', type=float, default=4.0, help='maximum unnormalized texture weight')
+    parser.add_argument('--lambda_stage1_depth', type=float, default=0, help='Stage 1 valid surface depth L1 weight (default disabled)')
+    parser.add_argument('--stage1_depth_manifest', default='', help='explicit training-view float NPY depth manifest')
     parser.add_argument('--lambda_lap', type=float, default=0.001, help="loss scale")#拉普拉斯平滑损失
     parser.add_argument('--lambda_normal', type=float, default=0, help="loss scale")#法向一致性损失
     parser.add_argument('--lambda_edgelen', type=float, default=0, help="loss scale")
@@ -109,6 +117,59 @@ if __name__ == '__main__':
     parser.add_argument('--ssaa', type=int, default=2, help="super sampling anti-aliasing ratio")
     parser.add_argument('--texture_size', type=int, default=4096, help="exported texture resolution")
     parser.add_argument('--refine', action='store_true', help="track face error and do subdivision")#开启自适应网格细化
+    parser.add_argument('--refine_mode', choices=['original', 'local'], default='original', help='stage 1 topology refinement mode')
+    parser.add_argument('--refine_experiment_steps', type=int, default=0, help='run a paired local refinement experiment for this many optimization steps')
+    parser.add_argument('--refine_experiment_views', type=int, default=5, help='number of fixed validation views for the refinement experiment')
+    parser.add_argument('--refine_selection_views', type=int, nargs='+', default=None, help='zero-based validation view indices for candidate selection')
+    parser.add_argument('--refine_evaluation_views', type=int, nargs='+', default=None, help='zero-based validation view indices for evaluation')
+    parser.add_argument('--refine_allow_view_overlap', action='store_true', help='allow selection and evaluation view indices to overlap')
+    parser.add_argument('--refine_compare_random', action='store_true', help='compare high-error and random selection with matched face budgets')
+    parser.add_argument('--refine_face_budget', type=int, default=0, help='maximum actual added faces for each comparison branch')
+    parser.add_argument('--refine_random_seeds', type=int, nargs='+', default=[0], help='random selection seeds for repeated comparisons')
+    parser.add_argument('--refine_rl', action='store_true', help='run the Stage 1 policy-gradient refinement experiment')
+    parser.add_argument('--refine_policy', choices=['mlp', 'gnn'], default='mlp', help='multi-round shared policy architecture')
+    parser.add_argument('--refine_rl_rounds', type=int, default=1, help='policy sampling and update rounds')
+    parser.add_argument('--refine_rl_reward_views', type=int, nargs='+', default=None, help='validation view indices for training rewards; defaults to selection views')
+    parser.add_argument('--refine_rl_lr', type=float, default=0.001, help='policy optimizer learning rate')
+    parser.add_argument('--refine_rl_checkpoint', type=str, default='', help='load policy checkpoint')
+    parser.add_argument('--refine_rl_eval', action='store_true', help='evaluate a loaded policy without updates')
+    parser.add_argument('--refine_rl_eval_mode', choices=['rank', 'threshold'], default='rank', help='rank all visible faces or request only faces with sigmoid probability >= 0.5')
+    parser.add_argument('--refine_multiround', action='store_true', help='run consecutive topology updates with face lineage rewards')
+    parser.add_argument('--refine_observation_graph', action='store_true', help='record sparse face graphs in multi-round training and evaluation; policy stays MLP')
+    parser.add_argument('--refine_graph_self_loops', action='store_true', help='add explicitly marked self loops to recorded observation graphs')
+    parser.add_argument('--refine_multiround_rounds', type=int, default=3, help='maximum topology updates in this invocation')
+    parser.add_argument('--refine_multiround_horizon', type=int, default=3, help='number of updates per truncated return segment')
+    parser.add_argument('--refine_silhouette_radius', type=float, default=8.0, help='maximum pixel distance for assigning uncovered target silhouette to a face')
+    parser.add_argument('--refine_multiround_gamma', type=float, default=0.9, help='lineage return discount')
+    parser.add_argument('--refine_multiround_sil_weight', type=float, default=1.0, help='silhouette reward weight')
+    parser.add_argument('--refine_multiround_rgb_weight', type=float, default=1.0, help='RGB reward weight')
+    parser.add_argument('--refine_multiround_grad_weight', type=float, default=0.0, help='Sobel gradient-improvement reward weight')
+    parser.add_argument('--refine_multiround_face_cost', type=float, default=0.001, help='cost per added face')
+    parser.add_argument('--refine_advantage_baseline', choices=['none', 'mean'], default='mean', help='baseline applied to considered valid face returns')
+    parser.add_argument('--refine_advantage_scale', choices=['none', 'std'], default='std', help='scale considered valid face advantages by their standard deviation')
+    parser.add_argument('--refine_advantage_clip', type=float, default=5.0, help='clip absolute processed advantages; 0 disables clipping')
+    parser.add_argument('--refine_candidate_fraction', type=float, default=0.5, help='fraction of valid faces selected by area')
+    parser.add_argument('--refine_candidate_mode', choices=['area', 'hybrid'], default='area')
+    parser.add_argument('--refine_area_fraction', type=float, default=0.4)
+    parser.add_argument('--refine_texture_fraction', type=float, default=0.1)
+    parser.add_argument('--refine_action_mode', choices=['bernoulli', 'categorical'], default='bernoulli')
+    parser.add_argument('--refine_rank_stop', action='store_true', help='include a learned categorical stop action')
+    parser.add_argument('--refine_min_face_area', type=float, default=1e-12, help='minimum valid triangle area')
+    parser.add_argument('--refine_gradient_ema_beta', type=float, default=0.9, help='vertex gradient EMA decay')
+    parser.add_argument('--refine_gradient_ema_warmup_steps', type=int, default=0, help='optimization steps used to initialize vertex gradient EMA before the first refinement')
+    parser.add_argument('--refine_reinitialize_legacy_policy', action='store_true', help='reinitialize incompatible completed legacy policy and vertex EMA')
+    parser.add_argument('--refine_multiround_resume', type=str, default='', help='resume trajectory checkpoint')
+    parser.add_argument('--refine_multibranch_eval', action='store_true', help='compare RL, high-error and random over consecutive refinement rounds')
+    parser.add_argument('--refine_face_gradient_diagnostics', action='store_true', help='save per-face fixed-region gradient diagnostics during multi-branch evaluation')
+    parser.add_argument('--refine_loss_gradient_diagnostics', action='store_true', help='compare RGB and image-gradient parameter gradients during multi-branch optimization')
+    parser.add_argument('--refine_loss_gradient_interval', type=int, default=10, help='sample training steps 1, 1+interval, ... within each round')
+    parser.add_argument('--refine_loss_gradient_max_samples', type=int, default=5, help='maximum diagnostic samples per round and branch')
+    parser.add_argument('--refine_multibranch_policy', type=str, default='', help='multi-round trajectory.pt containing the fixed RL policy')
+    parser.add_argument('--refine_multibranch_compare_policy', type=str, default='', help='optional second MLP/GNN trajectory for matched policy comparison')
+    parser.add_argument('--refine_multibranch_policy_mode', choices=['threshold', 'rank'], default='threshold', help='threshold at 0.5 or rank candidates with current remaining budget')
+    parser.add_argument('--refine_multibranch_rounds', type=int, default=3, help='number of consecutive evaluation rounds')
+    parser.add_argument('--refine_multibranch_total_budget', type=int, default=0, help='maximum total added faces; 0 means rounds times per-round budget')
+    parser.add_argument('--refine_experiment_output', type=str, default='', help='output directory for the refinement experiment')
     parser.add_argument("--refine_steps_ratio", type=float, action="append", default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.7])
     parser.add_argument('--refine_size', type=float, default=0.01, help="refine trig length")
     parser.add_argument('--refine_decimate_ratio', type=float, default=0.1, help="refine decimate ratio")
@@ -124,6 +185,27 @@ if __name__ == '__main__':
     parser.add_argument('--max_spp', type=int, default=1, help="GUI rendering max sample per pixel")
 
     opt = parser.parse_args()
+
+    if opt.refine_loss_gradient_diagnostics and (opt.refine_loss_gradient_interval < 1 or opt.refine_loss_gradient_max_samples < 1):
+        parser.error('Loss-gradient diagnostic interval and maximum samples must be positive')
+
+    if not math.isfinite(opt.lambda_image_grad) or opt.lambda_image_grad < 0:
+        parser.error('--lambda_image_grad must be finite and nonnegative')
+    if opt.lambda_image_grad > 0 and opt.stage != 1:
+        parser.error('--lambda_image_grad requires --stage 1')
+    if (not math.isfinite(opt.lambda_texture_weighted_grad) or opt.lambda_texture_weighted_grad < 0 or
+            not math.isfinite(opt.texture_gradient_gain) or opt.texture_gradient_gain < 0 or
+            not math.isfinite(opt.texture_gradient_weight_cap) or opt.texture_gradient_weight_cap < 1):
+        parser.error('Texture-weighted gradient loss requires nonnegative finite coefficient/gain and cap >= 1')
+    if opt.lambda_texture_weighted_grad > 0 and opt.stage != 1:
+        parser.error('--lambda_texture_weighted_grad requires --stage 1')
+
+    if not math.isfinite(opt.lambda_stage1_depth) or opt.lambda_stage1_depth < 0:
+        parser.error('--lambda_stage1_depth must be finite and nonnegative')
+    if opt.lambda_stage1_depth > 0 and (opt.stage != 1 or not opt.stage1_depth_manifest):
+        parser.error('Stage 1 depth requires --stage 1 and --stage1_depth_manifest')
+    if opt.refine_policy == 'gnn' and not opt.refine_multiround:
+        parser.error('--refine_policy gnn requires --refine_multiround; evaluation loads the policy type from its checkpoint')
 
     opt.cuda_ray = True
 
@@ -229,6 +311,11 @@ if __name__ == '__main__':
         
         else:
             valid_loader = NeRFDataset(opt, device=device, type='val').dataloader()
+
+            if opt.refine_experiment_steps:
+                from nerf.refinement_experiment import run_refinement_experiment
+                run_refinement_experiment(trainer, train_loader._data, valid_loader._data)
+                raise SystemExit(0)
 
             trainer.metrics = [PSNRMeter(),]
             trainer.train(train_loader, valid_loader, max_epoch)
