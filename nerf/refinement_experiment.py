@@ -98,7 +98,7 @@ def _foreground_errors(before, refined, control, view_ids):
                   'refined_error': means[1], 'control_error': means[2]}
 
 
-def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0.9):
+def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0.9, gradient_diagnostics=None):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -115,10 +115,34 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
     texture_weighted_losses = []
     scaled_texture_weighted_losses = []
     texture_weight_stats = []
-    for index in indices:
+    gradient_samples = []
+    for step, index in enumerate(indices):
         trainer.global_step += 1
         trainer.optimizer.zero_grad()
-        _, _, loss = trainer.train_step(dataset.collate([int(index)]))
+        sample_gradients = (gradient_diagnostics is not None and
+                            step % gradient_diagnostics['interval'] == 0 and
+                            len(gradient_samples) < gradient_diagnostics['max_samples'])
+        if gradient_diagnostics is not None:
+            trainer._gradient_diagnostic_requested = sample_gradients
+        try:
+            _, _, loss = trainer.train_step(dataset.collate([int(index)]))
+        finally:
+            if gradient_diagnostics is not None:
+                trainer._gradient_diagnostic_requested = False
+        if sample_gradients:
+            from nerf.refinement_loss_gradient_diagnostics import analyze_loss_gradients
+            components = getattr(trainer, '_gradient_diagnostic_losses', None)
+            rgb, gradient, pixels, reason = components if components is not None else (None, None, None, 'training_loss_components_unavailable')
+            groups = analyze_loss_gradients(trainer.model, trainer.optimizer, rgb, gradient, pixels,
+                                            getattr(trainer.opt, 'lambda_image_grad', 0.),
+                                            gradient_unavailable_reason=reason, amp_scale=trainer.scaler.get_scale())
+            gradient_samples.append({'step_in_round': step + 1, 'global_step': trainer.global_step,
+                                     'training_index': int(index), 'valid_gradient_pixels': pixels,
+                                     'amp_scale': trainer.scaler.get_scale(),
+                                     'rgb_loss': float(rgb.detach()) if rgb is not None and torch.isfinite(rgb.detach()).all() else None,
+                                     'image_gradient_loss': float(gradient.detach()) if gradient is not None and torch.isfinite(gradient.detach()).all() else None,
+                                     'groups': groups})
+            trainer._gradient_diagnostic_losses = None
         if getattr(trainer, 'loss_sil', None) is not None:
             silhouette_losses.append(float(trainer.loss_sil.item()))
         if getattr(trainer, 'loss_stage1_depth', None) is not None:
@@ -153,7 +177,7 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
             update_vertex_ema(vertex_state, norms, ema_beta,
                               step_finite and trainer.scaler.get_scale() >= old_scale)
         trainer.lr_scheduler.step()
-    return {'loss_sil_steps': silhouette_losses,
+    result = {'loss_sil_steps': silhouette_losses,
             'loss_sil_mean': float(np.mean(silhouette_losses)) if silhouette_losses else None,
             'loss_depth_steps': depth_losses, 'depth_valid_pixels': depth_valid_pixels,
             'loss_depth_mean': float(np.mean(depth_losses)) if depth_losses else None,
@@ -166,6 +190,21 @@ def _train_branch(trainer, dataset, indices, seed, vertex_state=None, ema_beta=0
             'scaled_loss_texture_weighted_grad_steps': scaled_texture_weighted_losses,
             'loss_texture_weighted_grad_mean': float(np.mean(texture_weighted_losses)) if texture_weighted_losses else None,
             'texture_gradient_weight_stats': texture_weight_stats}
+    if gradient_diagnostics is not None:
+        from nerf.refinement_loss_gradient_diagnostics import summarize, EPSILON, APPEARANCE_PREFIXES
+        result['loss_gradient_diagnostics'] = {'config': gradient_diagnostics, 'samples': gradient_samples,
+                                               'summary': summarize(gradient_samples),
+                                               'definitions': {'rgb_coefficient': 1.,
+                                                               'image_gradient_coefficient': getattr(trainer.opt, 'lambda_image_grad', 0.),
+                                                               'rgb_loss': 'current training RGB criterion, mean over channels and image pixels; uses current training background',
+                                                               'rgb_criterion': type(trainer.criterion).__name__,
+                                                               'image_gradient_loss': 'ordinary unweighted foreground Sobel SmoothL1 on fixed white background; excludes invalid 3x3 stencils',
+                                                               'color_space': getattr(trainer.opt, 'color_space', 'srgb'),
+                                                               'cosine': 'unscaled gradients; invalid if a group parameter is disconnected, nonfinite or norm <= epsilon',
+                                                               'epsilon': EPSILON, 'appearance_prefixes': list(APPEARANCE_PREFIXES),
+                                                               'optional_appearance_parameter': 'individual_codes',
+                                                               'amp': 'autograd.grad uses current loss scale, divides gradients by it; scaler state is untouched'}}
+    return result
 
 
 def _warmup_vertex_ema(trainer, dataset, vertex_state, steps, beta, seed):

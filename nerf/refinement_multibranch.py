@@ -170,6 +170,12 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
     opt = trainer.opt
     contour_radius = getattr(opt, 'refine_silhouette_radius', 8.0)
     diagnose_gradients = getattr(opt, 'refine_face_gradient_diagnostics', False)
+    loss_diagnostics = None
+    if getattr(opt, 'refine_loss_gradient_diagnostics', False):
+        loss_diagnostics = {'interval': getattr(opt, 'refine_loss_gradient_interval', 10),
+                            'max_samples': getattr(opt, 'refine_loss_gradient_max_samples', 5)}
+        if loss_diagnostics['interval'] < 1 or loss_diagnostics['max_samples'] < 1:
+            raise ValueError('Loss gradient diagnostic interval and maximum must be positive')
     policy_mode = getattr(opt, 'refine_multibranch_policy_mode', 'threshold')
     if policy_mode not in ('threshold', 'rank'):
         raise ValueError('Unknown multi-branch policy evaluation mode')
@@ -450,7 +456,9 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                            if diagnose_gradients else None)
             training_losses = _train_branch(trainer, train_data, training_indices[round_index], training_seeds[round_index],
                           vertex_state if is_rl and isinstance(policy, CandidatePolicy) else None,
-                          policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9)
+                          policy.candidate_settings['ema_beta'] if isinstance(policy, CandidatePolicy) else 0.9,
+                          gradient_diagnostics=loss_diagnostics)
+            loss_diagnostic_report = training_losses.pop('loss_gradient_diagnostics', None)
             after_selection = _observe_silhouette(trainer, val_data, selection_views, texture=collect_selection_texture)
             if graph_files is not None:
                 post_sums, post_pixels, post_views = visibility_counts(after_selection, len(model.triangles))
@@ -573,6 +581,13 @@ def run_multibranch(trainer, train_data, val_data, selection_views, evaluation_v
                                      'training_seed': training_seeds[round_index], 'event': event,
                                      'training_losses': training_losses,
                                      'metrics': metrics})
+            if loss_diagnostic_report is not None:
+                diagnostic_file = 'loss_gradient_diagnostics_{}_round_{:04d}.json'.format(branch_name, round_index + 1)
+                loss_diagnostic_report.update(method=method, branch=branch_name, round=round_index + 1,
+                                              views='current training images only; independent evaluation views excluded')
+                _save_json(os.path.join(opt.refine_experiment_output, diagnostic_file), loss_diagnostic_report)
+                branch['rounds'][-1]['loss_gradient_diagnostics'] = {'file': diagnostic_file,
+                                                                     'summary': loss_diagnostic_report['summary']}
             _save_json(os.path.join(opt.refine_experiment_output, 'branch_{}.json'.format(branch_name)), branch)
             trainer.log('[INFO] {} seed {} round {}: {} added faces'.format(
                 method, random_seed, round_index + 1, actual))

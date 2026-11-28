@@ -161,6 +161,9 @@ if __name__ == '__main__':
     parser.add_argument('--refine_multiround_resume', type=str, default='', help='resume trajectory checkpoint')
     parser.add_argument('--refine_multibranch_eval', action='store_true', help='compare RL, high-error and random over consecutive refinement rounds')
     parser.add_argument('--refine_face_gradient_diagnostics', action='store_true', help='save per-face fixed-region gradient diagnostics during multi-branch evaluation')
+    parser.add_argument('--refine_loss_gradient_diagnostics', action='store_true', help='compare RGB and image-gradient parameter gradients during multi-branch optimization')
+    parser.add_argument('--refine_loss_gradient_interval', type=int, default=10, help='sample training steps 1, 1+interval, ... within each round')
+    parser.add_argument('--refine_loss_gradient_max_samples', type=int, default=5, help='maximum diagnostic samples per round and branch')
     parser.add_argument('--refine_multibranch_policy', type=str, default='', help='multi-round trajectory.pt containing the fixed RL policy')
     parser.add_argument('--refine_multibranch_compare_policy', type=str, default='', help='optional second MLP/GNN trajectory for matched policy comparison')
     parser.add_argument('--refine_multibranch_policy_mode', choices=['threshold', 'rank'], default='threshold', help='threshold at 0.5 or rank candidates with current remaining budget')
@@ -182,6 +185,9 @@ if __name__ == '__main__':
     parser.add_argument('--max_spp', type=int, default=1, help="GUI rendering max sample per pixel")
 
     opt = parser.parse_args()
+
+    if opt.refine_loss_gradient_diagnostics and (opt.refine_loss_gradient_interval < 1 or opt.refine_loss_gradient_max_samples < 1):
+        parser.error('Loss-gradient diagnostic interval and maximum samples must be positive')
 
     if not math.isfinite(opt.lambda_image_grad) or opt.lambda_image_grad < 0:
         parser.error('--lambda_image_grad must be finite and nonnegative')

@@ -640,6 +640,7 @@ class Trainer(object):
         self.loss_texture_weighted_grad = None
         self.scaled_loss_texture_weighted_grad = None
         self.texture_gradient_weight_stats = None
+        self._gradient_diagnostic_losses = None
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         index = data['index'] # [1/N]
@@ -731,6 +732,7 @@ class Trainer(object):
                 self.model.update_triangles_errors(loss.detach())
 
         loss = loss.mean()
+        rgb_training_loss = loss
 
         # extra loss...
         if self.opt.stage == 0:
@@ -750,8 +752,16 @@ class Trainer(object):
         if self.opt.stage == 1:
             lambda_image_grad = getattr(self.opt, 'lambda_image_grad', 0.0)
             lambda_texture_grad = getattr(self.opt, 'lambda_texture_weighted_grad', 0.0)
-            if lambda_image_grad > 0 or lambda_texture_grad > 0:
-                foreground = stage1_foreground_alpha(images, data, (H, W), pred_rgb.device)
+            gradient_diagnostic = getattr(self, '_gradient_diagnostic_requested', False)
+            if lambda_image_grad > 0 or lambda_texture_grad > 0 or gradient_diagnostic:
+                try:
+                    foreground = stage1_foreground_alpha(images, data, (H, W), pred_rgb.device)
+                except ValueError:
+                    if lambda_image_grad > 0 or lambda_texture_grad > 0:
+                        raise
+                    foreground = None
+                    self._gradient_diagnostic_losses = (rgb_training_loss, None, None, 'missing_or_invalid_foreground_mask')
+            if (lambda_image_grad > 0 or lambda_texture_grad > 0 or gradient_diagnostic) and foreground is not None:
                 # Undo the random-background composite using the attached AA alpha.
                 # The result is exactly the same rendering on a fixed white background.
                 alpha = outputs['alpha'].reshape(-1, 1)
@@ -768,13 +778,22 @@ class Trainer(object):
                     self.scaled_loss_texture_weighted_grad = (lambda_texture_grad * texture_loss).detach()
                     self.texture_gradient_weight_stats = weight_stats
                     loss = loss + lambda_texture_grad * texture_loss
+                    if gradient_diagnostic:
+                        diagnostic_gradient_loss, diagnostic_pixels = stage1_image_gradient_loss(
+                            prediction_white.reshape(H, W, 3), target_white.reshape(H, W, 3), foreground)
                 else:
                     loss_image_grad, valid_pixels = stage1_image_gradient_loss(
                         prediction_white.reshape(H, W, 3), target_white.reshape(H, W, 3), foreground)
-                self.loss_image_grad = loss_image_grad.detach()
-                self.weighted_loss_image_grad = (lambda_image_grad * loss_image_grad).detach()
-                self.image_grad_valid_pixels = valid_pixels
-                loss = loss + lambda_image_grad * loss_image_grad
+                if gradient_diagnostic:
+                    if lambda_texture_grad <= 0:
+                        diagnostic_gradient_loss, diagnostic_pixels = loss_image_grad, valid_pixels
+                    self._gradient_diagnostic_losses = (rgb_training_loss, diagnostic_gradient_loss, diagnostic_pixels, None)
+                if lambda_image_grad > 0 or lambda_texture_grad > 0:
+                    self.loss_image_grad = loss_image_grad.detach()
+                    self.weighted_loss_image_grad = (lambda_image_grad * loss_image_grad).detach()
+                    self.image_grad_valid_pixels = valid_pixels
+                if lambda_image_grad > 0 or lambda_texture_grad > 0:
+                    loss = loss + lambda_image_grad * loss_image_grad
             if getattr(self.opt, 'lambda_stage1_depth', 0) > 0:
                 loss_depth, valid_count = stage1_depth_loss(outputs['surface_depth'], outputs['surface_depth_hit'], target_depth, target_valid)
                 self.loss_stage1_depth = loss_depth.detach()

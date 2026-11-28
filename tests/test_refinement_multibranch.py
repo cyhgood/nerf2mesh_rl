@@ -138,7 +138,8 @@ class MultiBranchTest(unittest.TestCase):
                                   refine_multibranch_total_budget=3, refine_random_seeds=[0, 1],
                                   refine_multibranch_policy=policy_path, ckpt=checkpoint, mesh=mesh,
                                   seed=7, refine_experiment_steps=2, refine_experiment_output=directory,
-                                  refine=True)
+                                  refine=True, refine_loss_gradient_diagnostics=True,
+                                  refine_loss_gradient_interval=1, refine_loss_gradient_max_samples=1)
             trainer = SimpleNamespace(opt=opt, model=model, device=torch.device('cpu'), global_step=10,
                                       criterion=torch.nn.SmoothL1Loss(reduction='none'),
                                       scaler=torch.cuda.amp.GradScaler(enabled=False))
@@ -156,7 +157,10 @@ class MultiBranchTest(unittest.TestCase):
 
             def train_step(data):
                 used_samples.append(data['index'])
-                return None, None, (model.color - 0.8).square() + model.vertices_offsets.square().sum()
+                loss = (model.color - 0.8).square() + (model.vertices_offsets - 0.1).square().sum()
+                if getattr(trainer, '_gradient_diagnostic_requested', False):
+                    trainer._gradient_diagnostic_losses = (loss, loss * 2, 1, None)
+                return None, None, loss
 
             trainer.eval_step = eval_step
             trainer.train_step = train_step
@@ -181,6 +185,10 @@ class MultiBranchTest(unittest.TestCase):
                 self.assertEqual(branch['initial_metrics'], result['initial_metrics'])
                 self.assertEqual(branch['final_metrics']['overall']['pixels'], 3)
                 for step in branch['rounds']:
+                    with open(os.path.join(directory, step['loss_gradient_diagnostics']['file'])) as source:
+                        diagnostic = json.load(source)
+                    self.assertEqual(len(diagnostic['samples']), 1)
+                    self.assertEqual(diagnostic['summary']['vertex_offsets']['valid_count'], 1)
                     self.assertLessEqual(step['actual_added_faces'], step['round_budget'])
                     self.assertEqual(step['event']['added_faces'], step['actual_added_faces'])
                     with np.load(os.path.join(directory, step['face_observations'])) as faces:
@@ -197,6 +205,7 @@ class MultiBranchTest(unittest.TestCase):
             model = Model()
             trainer.model = model
             trainer.global_step = 10
+            opt.refine_loss_gradient_diagnostics = False
             opt.refine = True
             opt.refine_candidate_fraction = .5
             opt.refine_min_face_area = 1e-12
